@@ -1043,7 +1043,7 @@ ensure_shortcut() {
     [[ -f "$target" ]] && return
     cat > "$target" << 'SCEOF'
 #!/bin/sh
-exec bash <(curl -fsSL https://raw.githubusercontent.com/你的用户名/singbox-cf-lite/main/singbox_cf_lite.sh) "$@"
+exec bash <(curl -fsSL https://raw.githubusercontent.com/qiuxiaoyu001/singbox-cf-lite2/main/singbox_cf_lite.sh) "$@"
 SCEOF
     chmod +x "$target"
 }
