@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 # ═══════════════════════════════════════════════════════════
-#  sing-box-cf-lite  —  六协议一键脚本
-#  CF类(走Cloudflare): VLESS+WS | VMess+WS | Trojan+WS
-#  直连类(IP直达):     VLESS-Reality | Hysteria2 | TUIC v5
-#  内核: sing-box 精简版 (UPX) · 64M小鸡可跑
+#  sing-box-cf-lite  —  三协议 Cloudflare 一键脚本
+#  协议: VLESS+WS | VMess+WS | Trojan+WS  (CF flexible 边缘 TLS)
+#  内核: sing-box 精简版 (UPX) ·小鸡可跑
+#  代码透明 · 二进制仅从官方/指定源下载
 # ═══════════════════════════════════════════════════════════
 
 # ── 常量 ──────────────────────────────────────────────
@@ -17,21 +17,19 @@ CF_ACCOUNT_PATH="$STATE_DIR/cf_account.json"
 LAST_LINKS_PATH="$(pwd)/sb_cf_lite_last_links.txt"
 CF_API="https://api.cloudflare.com/client/v4"
 MANAGED_PREFIX="sb-cf-lite "
+# 精简版二进制地址（UPX 压缩，~5MB）；留空则从官方下载完整版
+# 自己编译: CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" ./cmd/sing-box && upx --best --lzma sing-box
 SINGBOX_MINI_URL="${SINGBOX_MINI_URL:-}"
 SINGBOX_OFFICIAL_API="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
 
-declare -A PROTO_LABEL=([vless]="VLESS+WS" [trojan]="Trojan+WS" [vmess]="VMess+WS" [reality]="VLESS-Reality" [hysteria2]="Hysteria2" [tuic]="TUIC v5")
-declare -A PROTO_MODE=([vless]=cf [trojan]=cf [vmess]=cf [reality]=direct [hysteria2]=direct [tuic]=direct)
-declare -A PROTO_SUFFIX=([vless]=vl [trojan]=tr [vmess]=vm)
+declare -A PROTO_SUFFIX=([vless]="vl" [trojan]="tr" [vmess]="vm")
+declare -A PROTO_LABEL=([vless]="VLESS" [trojan]="TROJAN" [vmess]="VMESS")
 
 # ── 工具 ──────────────────────────────────────────────
 die()     { printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 ok()      { printf '\033[32m✓\033[0m %s\n' "$*" >&2; }
 info()    { printf '\033[36m·\033[0m %s\n' "$*" >&2; }
-warn()    { printf '\033[33m⚠ %s\033[0m\n' "$*" >&2; }
 need_cmd(){ command -v "$1" &>/dev/null || die "缺少依赖: $1"; }
-b64()     { base64 | tr -d '\n'; }
-
 urlencode() {
     local s="$1" c
     local -i i
@@ -44,15 +42,6 @@ urlencode() {
     done
 }
 gen_uuid() { cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen | tr '[:upper:]' '[:lower:]'; }
-gen_rand_pass() { head -c 16 /dev/urandom | base64 | tr -d '/+=\n'; }
-gen_shortid() { head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
-gen_reality_keypair() {
-    local tmp
-    tmp=$("$SINGBOX_BINARY" generate reality-keypair 2>/dev/null)
-    REALITY_PRIVATE=$(echo "$tmp" | grep -i "PrivateKey" | awk '{print $2}')
-    REALITY_PUBLIC=$(echo "$tmp" | grep -i "PublicKey" | awk '{print $2}')
-    [ -n "$REALITY_PRIVATE" ] && [ -n "$REALITY_PUBLIC" ] || die "Reality 密钥生成失败，内核需 with_reality tag"
-}
 
 # ── 内存检测（64M 小鸡优化）──────────────────────────
 get_mem_mb() {
@@ -62,6 +51,7 @@ get_mem_mb() {
     echo "$mem"
 }
 ensure_swap() {
+    # 64M 小鸡必加 swap，否则 sing-box 启动时可能 OOM
     local mem
     mem=$(get_mem_mb)
     [[ "$mem" -ge 128 ]] && return 0
@@ -103,7 +93,7 @@ install_deps() {
     elif command -v yum &>/dev/null; then
         yum install -y "${missing[@]}"
     else
-        die "无法安装依赖，请手动安装 curl jq"
+        die "无法安装依赖 ${missing[*]}，请手动安装"
     fi
 }
 
@@ -130,8 +120,10 @@ INITEOF
     chmod +x "$SINGBOX_OPENRC_SCRIPT"
 }
 write_systemd_service() {
-    local mem_limit="" total_mem
+    local mem_limit=""
+    local total_mem
     total_mem=$(get_mem_mb)
+    # 64M 小鸡限制内存，防止 OOM 拖垮系统
     if [[ "$total_mem" -lt 128 ]]; then
         mem_limit="MemoryMax=56M
 MemoryHigh=48M"
@@ -141,6 +133,7 @@ MemoryHigh=48M"
 Description=sing-box service (cf-lite)
 Documentation=https://sing-box.sagernet.org
 After=network.target nss-lookup.target
+
 [Service]
 User=root
 WorkingDirectory=${SINGBOX_WORK_DIR}
@@ -150,6 +143,7 @@ Restart=on-failure
 RestartSec=1
 LimitNOFILE=infinity
 ${mem_limit}
+
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -163,9 +157,10 @@ restart_singbox() {
     svc_enable
     svc_start || die "sing-box 重启失败"
     sleep 1
-    svc_is_active || die "sing-box 未正常启动，请查看日志"
+    svc_is_active || die "sing-box 未正常启动，请查看日志: journalctl -u sing-box"
     ok "sing-box 服务已启动"
 }
+stop_singbox() { svc_stop; }
 
 # ── 网络检测 ─────────────────────────────────────────
 get_public_ip() {
@@ -179,19 +174,35 @@ detect_nat() {
     local public_ip
     public_ip=$(get_public_ip)
     if ip addr show 2>/dev/null | grep -qE "inet ${public_ip}/"; then
-        echo "direct"; return
+        echo "direct"
+        return
     fi
     echo "nat"
 }
-net_mode_label() { [[ "$1" == "direct" ]] && echo "直连" || echo "NAT"; }
+net_mode_label() {
+    [[ "$1" == "direct" ]] && echo "直连（公网端口直达本机）" || echo "NAT（需要端口映射）"
+}
 prompt_net_mode() {
     local detected="$1" ans
     echo >&2
     info "网络环境探测结果: $(net_mode_label "$detected")" >&2
+    if [[ "$detected" == "nat" ]]; then
+        echo "  如果这台机器有独立公网 IP、外部能直接连到你要开的端口（常见于云厂商的一对一 NAT）," >&2
+        echo "  这里就该选直连，否则会让你填一堆并不存在的端口映射。" >&2
+    else
+        echo "  如果这台机器其实在 NAT/软路由后面，对外端口和本机监听端口不一致，这里要选 NAT。" >&2
+    fi
     read -rp "使用哪种模式? (1=直连, 2=NAT, 回车=用探测结果): " ans
-    case "$ans" in 1) echo "direct" ;; 2) echo "nat" ;; "") echo "$detected" ;; *) die "无效选项" ;; esac
+    case "$ans" in
+        1) echo "direct" ;;
+        2) echo "nat" ;;
+        "") echo "$detected" ;;
+        *) die "无效选项: $ans" ;;
+    esac
 }
-get_listening_ports() { ss -tlnH 2>/dev/null | awk '{print $4}' | grep -oE '[0-9]+$' | sort -un | tr '\n' ' '; }
+get_listening_ports() {
+    ss -tlnH 2>/dev/null | awk '{print $4}' | grep -oE '[0-9]+$' | sort -un | tr '\n' ' '
+}
 rand_port() {
     local existing="$1" p
     while true; do
@@ -229,9 +240,13 @@ save_cf_account() {
 }
 cf_verify_credentials() {
     local r
-    r=$(curl -s -X GET "${CF_API}/user/tokens/verify" -H "X-Auth-Email: $CF_EMAIL" -H "X-Auth-Key: $CF_KEY" -H "Content-Type: application/json")
-    echo "$r" | jq -e '.success == true' &>/dev/null && return 0
-    r=$(curl -s -X GET "${CF_API}/zones?per_page=1" -H "X-Auth-Email: $CF_EMAIL" -H "X-Auth-Key: $CF_KEY" -H "Content-Type: application/json")
+    r=$(curl -s -X GET "${CF_API}/user/tokens/verify" \
+        -H "X-Auth-Email: $CF_EMAIL" -H "X-Auth-Key: $CF_KEY" -H "Content-Type: application/json")
+    if echo "$r" | jq -e '.success == true' &>/dev/null; then
+        return 0
+    fi
+    r=$(curl -s -X GET "${CF_API}/zones?per_page=1" \
+        -H "X-Auth-Email: $CF_EMAIL" -H "X-Auth-Key: $CF_KEY" -H "Content-Type: application/json")
     echo "$r" | jq -e '.success == true' &>/dev/null
 }
 prompt_cf() {
@@ -239,21 +254,30 @@ prompt_cf() {
         local masked="${CF_KEY:0:6}...${CF_KEY: -4}"
         read -rp "复用已保存 CF 凭据 ($CF_EMAIL, Key=$masked)? (Y/n): " ans
         if [[ "${ans,,}" =~ ^(|y|yes)$ ]]; then
-            cf_verify_credentials && return 0
+            if cf_verify_credentials; then
+                return 0
+            fi
             echo "已保存的 CF 凭据校验失败，请重新输入"
         fi
     fi
     while true; do
         read -rp "Cloudflare 邮箱: " CF_EMAIL || die "输入已中断"
         read -rsp "Cloudflare Global API Key: " CF_KEY || die "输入已中断"; echo
-        [[ -z "$CF_EMAIL" || -z "$CF_KEY" ]] && { echo "邮箱和 API Key 不能为空"; continue; }
+        if [[ -z "$CF_EMAIL" || -z "$CF_KEY" ]]; then
+            echo "邮箱和 API Key 不能为空，请重试"
+            continue
+        fi
         echo -n "校验凭据... "
-        if cf_verify_credentials; then echo "通过"; save_cf_account; return 0; fi
-        echo "失败：邮箱或 API Key 错误"
+        if cf_verify_credentials; then
+            echo "通过"
+            save_cf_account
+            return 0
+        fi
+        echo "失败：邮箱或 API Key 错误，请重新输入（Ctrl+C 退出）"
     done
 }
 
-# ── CF DNS / SSL / Origin Rules / 安全规则 ────────────
+# ── CF DNS / SSL / Origin Rules ───────────────────────
 cf_find_zone() {
     local domain="$1" zones best_name="" best_id=""
     zones=$(cf_call GET "/zones?per_page=100" | jq -r '.result[] | "\(.name) \(.id)"')
@@ -265,9 +289,12 @@ cf_find_zone() {
     [[ -n "$best_id" ]] || return 1
     echo "$best_id"
 }
-cf_get_dns() { cf_call GET "/zones/$1/dns_records?type=A&name=$2" | jq '.result[0] // empty'; }
+cf_get_dns() {
+    cf_call GET "/zones/$1/dns_records?type=A&name=$2" | jq '.result[0] // empty'
+}
 cf_upsert_dns() {
-    local zone_id="$1" domain="$2" ip="$3" payload existing
+    local zone_id="$1" domain="$2" ip="$3"
+    local payload existing
     payload=$(jq -n --arg n "$domain" --arg c "$ip" '{type:"A",name:$n,content:$c,proxied:true,ttl:1}')
     existing=$(cf_get_dns "$zone_id" "$domain")
     if [[ -n "$existing" ]]; then
@@ -279,6 +306,8 @@ cf_upsert_dns() {
 }
 cf_get_ssl()  { cf_call GET "/zones/$1/settings/ssl" | jq -r '.result.value'; }
 cf_set_ssl()  { cf_call PATCH "/zones/$1/settings/ssl" "$(jq -n --arg v "$2" '{value:$v}')" >/dev/null; }
+
+# ── CF 安全规则 ───────────────────────────────────────
 cf_get_security_level() { cf_call GET "/zones/$1/settings/security_level" | jq -r '.result.value'; }
 cf_set_security_level() { cf_call PATCH "/zones/$1/settings/security_level" "$(jq -n --arg v "$2" '{value:$v}')" >/dev/null; }
 cf_get_browser_check() { cf_call GET "/zones/$1/settings/browser_check" | jq -r '.result.value'; }
@@ -286,27 +315,53 @@ cf_set_browser_check() { cf_call PATCH "/zones/$1/settings/browser_check" "$(jq 
 cf_get_bot_management() { cf_call_raw GET "/zones/$1/bot_management" | jq '.result // {}'; }
 cf_set_bot_fight_off() {
     local zone_id="$1"
-    cf_call_raw PUT "/zones/${zone_id}/bot_management" "$(jq -n '{enable_js:false,sbfm_likely_automated:"allow",sbfm_definitely_automated:"allow",sbfm_verified_bots:"allow",sbfm_static_resource_protection:false}')" | jq -e '.success' &>/dev/null
+    cf_call_raw PUT "/zones/${zone_id}/bot_management" "$(jq -n '{
+        enable_js: false,
+        sbfm_likely_automated: "allow",
+        sbfm_definitely_automated: "allow",
+        sbfm_verified_bots: "allow",
+        sbfm_static_resource_protection: false
+    }')" | jq -e '.success' &>/dev/null
 }
 cf_restore_bot_management() {
-    local zone_id="$1" backup="$2" payload
-    payload=$(echo "$backup" | jq '{enable_js:.enable_js,sbfm_likely_automated:.sbfm_likely_automated,sbfm_definitely_automated:.sbfm_definitely_automated,sbfm_verified_bots:.sbfm_verified_bots,sbfm_static_resource_protection:.sbfm_static_resource_protection}')
+    local zone_id="$1" backup="$2"
+    local payload
+    payload=$(echo "$backup" | jq '{
+        enable_js: .enable_js,
+        sbfm_likely_automated: .sbfm_likely_automated,
+        sbfm_definitely_automated: .sbfm_definitely_automated,
+        sbfm_verified_bots: .sbfm_verified_bots,
+        sbfm_static_resource_protection: .sbfm_static_resource_protection
+    }')
     cf_call_raw PUT "/zones/${zone_id}/bot_management" "$payload" | jq -e '.success' &>/dev/null
 }
 cf_relax_security() {
-    local zone_id="$1" sec_level bot_mgmt browser_check
+    local zone_id="$1"
+    local sec_level bot_mgmt browser_check
     sec_level=$(cf_get_security_level "$zone_id")
     browser_check=$(cf_get_browser_check "$zone_id")
     bot_mgmt=$(cf_get_bot_management "$zone_id")
-    [[ "$sec_level" != "essentially_off" ]] && { cf_set_security_level "$zone_id" "essentially_off"; ok "Security Level: essentially_off"; }
-    [[ "$browser_check" != "off" ]] && { cf_set_browser_check "$zone_id" "off"; ok "Browser Check: off"; }
-    local sbfm_likely; sbfm_likely=$(echo "$bot_mgmt" | jq -r '.sbfm_likely_automated // ""')
-    [[ "$sbfm_likely" != "allow" ]] && { cf_set_bot_fight_off "$zone_id"; ok "Bot Fight Mode: 已关闭"; }
-    jq -n --arg sl "$sec_level" --arg bc "$browser_check" --argjson bm "$bot_mgmt" '{security_level:$sl,browser_check:$bc,bot_management:$bm}'
+    if [[ "$sec_level" != "essentially_off" ]]; then
+        cf_set_security_level "$zone_id" "essentially_off"
+        ok "Security Level: essentially_off"
+    fi
+    if [[ "$browser_check" != "off" ]]; then
+        cf_set_browser_check "$zone_id" "off"
+        ok "Browser Check: off"
+    fi
+    local sbfm_likely
+    sbfm_likely=$(echo "$bot_mgmt" | jq -r '.sbfm_likely_automated // ""')
+    if [[ "$sbfm_likely" != "allow" ]]; then
+        cf_set_bot_fight_off "$zone_id"
+        ok "Bot Fight Mode: 已关闭"
+    fi
+    jq -n --arg sl "$sec_level" --arg bc "$browser_check" --argjson bm "$bot_mgmt" \
+        '{security_level:$sl, browser_check:$bc, bot_management:$bm}'
 }
 cf_restore_security() {
-    local zone_id="$1" backup="$2" sl bc bm
+    local zone_id="$1" backup="$2"
     [[ -z "$backup" || "$backup" == "null" ]] && return
+    local sl bc bm
     sl=$(echo "$backup" | jq -r '.security_level // ""')
     bc=$(echo "$backup" | jq -r '.browser_check // ""')
     bm=$(echo "$backup" | jq '.bot_management // null')
@@ -319,7 +374,8 @@ cf_get_origin_rules() {
     echo "$r" | jq -r 'if .success then .result.rules // [] else [] end' 2>/dev/null || echo '[]'
 }
 cf_put_origin_rules() {
-    local r; r=$(cf_call_raw PUT "/zones/$1/rulesets/phases/http_request_origin/entrypoint" "$(jq -n --argjson r "$2" '{rules:$r}')")
+    local r; r=$(cf_call_raw PUT "/zones/$1/rulesets/phases/http_request_origin/entrypoint" \
+        "$(jq -n --argjson r "$2" '{rules:$r}')")
     echo "$r" | jq -e '.success' &>/dev/null || die "Origin Rules 写入失败: $(echo "$r" | jq -c '.errors')"
 }
 build_new_origin_rules() {
@@ -335,147 +391,158 @@ build_new_origin_rules() {
     ]'
 }
 apply_origin_rules() {
-    local zone_id="$1" domain="$2" routes_json="$3" existing kept new_managed merged
+    local zone_id="$1" domain="$2" routes_json="$3"
+    local existing kept new_managed merged
     existing=$(cf_get_origin_rules "$zone_id")
     kept=$(echo "$existing" | jq --arg d "$domain" --arg pfx "$MANAGED_PREFIX" '[
-        .[] | select((.description | startswith($pfx) | not) or (.expression | ascii_downcase | contains("http.host eq \"" + ($d|ascii_downcase) + "\"") | not))
+        .[] | select(
+            (.description | startswith($pfx) | not) or
+            (.expression | ascii_downcase | contains("http.host eq \"" + ($d|ascii_downcase) + "\"") | not)
+        )
     ]')
     new_managed=$(build_new_origin_rules "$domain" "$routes_json")
     merged=$(jq -n --argjson a "$kept" --argjson b "$new_managed" '$a + $b')
     cf_put_origin_rules "$zone_id" "$merged"
 }
 
-# ── sing-box 安装 ─────────────────────────────────────
+# ── sing-box 安装（精简二进制）────────────────────────
 get_singbox_arch() {
     case "$(uname -m)" in
-        x86_64|amd64) echo "amd64" ;; aarch64|arm64) echo "arm64" ;;
-        armv7l) echo "armv7" ;; i386|i686) echo "386" ;; s390x) echo "s390x" ;;
+        x86_64|amd64) echo "amd64" ;;
+        aarch64|arm64) echo "arm64" ;;
+        armv7l) echo "armv7" ;;
+        i386|i686) echo "386" ;;
+        s390x) echo "s390x" ;;
         *) die "不支持的架构: $(uname -m)" ;;
     esac
 }
 install_singbox() {
     echo "正在安装 sing-box ..."
     [[ -f "$SINGBOX_BINARY" ]] && { ok "sing-box 已安装，跳过"; return; }
-    local arch; arch=$(get_singbox_arch)
-    local mem; mem=$(get_mem_mb)
+
+    local arch
+    arch=$(get_singbox_arch)
+    local mem
+    mem=$(get_mem_mb)
+
+    # 优先级: SINGBOX_MINI_URL 环境变量 > 低内存自动用精简版 > 官方完整版
     local download_url=""
     if [[ -n "$SINGBOX_MINI_URL" ]]; then
         download_url="$SINGBOX_MINI_URL"
         info "使用自定义精简版地址"
     elif [[ "$mem" -lt 128 ]]; then
-        warn "检测到内存仅 ${mem}MB，建议使用精简版 (UPX)"
-        echo "  设置: export SINGBOX_MINI_URL=https://你的地址/sing-box-linux-${arch}"
-        read -rp "继续用官方完整版? (y/N): " use_official
-        [[ "${use_official,,}" =~ ^(y|yes)$ ]] || die "已取消，请先配置 SINGBOX_MINI_URL"
+        echo ""
+        warn "检测到内存仅 ${mem}MB，官方完整版 (~15MB) 可能运行不稳定"
+        echo "  精简版 (UPX压缩, ~5MB) 更适合低内存小鸡"
+        echo "  编译方法: CGO_ENABLED=0 go build -trimpath -ldflags \"-s -w\" ./cmd/sing-box && upx --best --lzma sing-box"
+        read -rp "使用精简版? (Y/n，回车=是): " use_mini
+        if [[ "${use_mini,,}" =~ ^(|y|yes)$ ]]; then
+            if [[ -z "$SINGBOX_MINI_URL" ]]; then
+                echo ""
+                echo "  请设置精简版下载地址:"
+                echo "    export SINGBOX_MINI_URL=https://你的地址/sing-box-linux-${arch}"
+                echo "    bash $0 install"
+                echo ""
+                echo "  或继续使用官方完整版（可能 OOM）"
+                read -rp "继续用官方完整版? (y/N): " use_official
+                [[ "${use_official,,}" =~ ^(y|yes)$ ]] || die "已取消，请先配置 SINGBOX_MINI_URL"
+            else
+                download_url="$SINGBOX_MINI_URL"
+            fi
+        fi
     fi
+
     mkdir -p "$SINGBOX_WORK_DIR" "$SINGBOX_CONF_DIR"
+
     if [[ -n "$download_url" ]]; then
         info "下载精简版 sing-box (${arch})..."
         curl -fsSL "$download_url" -o "$SINGBOX_BINARY" || die "精简版下载失败"
         chmod +x "$SINGBOX_BINARY"
     else
-        local ver=""; ver=$(curl -sf "$SINGBOX_OFFICIAL_API" 2>/dev/null | jq -r '.tag_name' 2>/dev/null) || true
+        # 官方完整版
+        local ver=""
+        ver=$(curl -sf "$SINGBOX_OFFICIAL_API" 2>/dev/null | jq -r '.tag_name' 2>/dev/null) || true
         [[ -n "$ver" && "$ver" != "null" ]] && ver="${ver#v}" || ver="1.11.0"
         info "下载 sing-box v${ver} (linux/${arch})..."
         local url="https://github.com/SagerNet/sing-box/releases/download/v${ver}/sing-box-${ver}-linux-${arch}.tar.gz"
-        local tmp="/tmp/sb-install-$$"; mkdir -p "$tmp"
+        local tmp="/tmp/sb-install-$$"
+        mkdir -p "$tmp"
         curl -fsSL -o "$tmp/sb.tar.gz" "$url" || die "下载失败"
         tar xzf "$tmp/sb.tar.gz" -C "$tmp/"
         cp "$tmp/sing-box-${ver}-linux-${arch}/sing-box" "$SINGBOX_BINARY"
-        chmod +x "$SINGBOX_BINARY"; rm -rf "$tmp"
+        chmod +x "$SINGBOX_BINARY"
+        rm -rf "$tmp"
     fi
+
+    # 验证二进制可用
     "$SINGBOX_BINARY" version >/dev/null 2>&1 || die "sing-box 二进制不可用"
     ok "sing-box 安装完成: $("$SINGBOX_BINARY" version 2>/dev/null | head -1)"
 }
 
-# ── sing-box 配置生成（六协议）────────────────────────
+# ── sing-box 配置生成（多文件）────────────────────────
 gen_singbox_config() {
-    local routes_json="$1" uid="$2" rpk="${3:-}" rsid="${4:-}" hpass="${5:-}" tpass="${6:-}"
-    local conf_dir="$SINGBOX_CONF_DIR"; mkdir -p "$conf_dir"
+    local routes_json="$1" uid="$2"
+    local conf_dir="$SINGBOX_CONF_DIR"
+    mkdir -p "$conf_dir"
+
+    # log — error 级别最省内存
     cat > "$conf_dir/log.json" << 'EOF'
 {"log":{"disabled":false,"level":"error","output":"/etc/sing-box/sing-box.log","timestamp":false}}
 EOF
+
+    # dns — 本地解析，不远程查询，最省内存
     cat > "$conf_dir/dns.json" << 'EOF'
 {"dns":{"servers":[{"tag":"local","type":"local"}],"strategy":"ipv4_only"}}
 EOF
+
+    # inbounds — 三个协议，均 WS 无 TLS（CF flexible 模式，TLS 在边缘终止）
     local inbounds
-    inbounds=$(echo "$routes_json" | jq \
-        --arg uid "$uid" --arg rpk "$rpk" --arg rsid "$rsid" --arg hpass "$hpass" --arg tpass "$tpass" \
-        '[.[] |
-            if .protocol == "vless" then
-                {tag:("in-vless-"+(.listen_port|tostring)), type:"vless", listen:"::", listen_port:.listen_port,
-                 users:[{"uuid":$uid}], transport:{"type":"ws","path":.path}}
-            elif .protocol == "vmess" then
-                {tag:("in-vmess-"+(.listen_port|tostring)), type:"vmess", listen:"::", listen_port:.listen_port,
-                 users:[{"uuid":$uid}], transport:{"type":"ws","path":.path}}
-            elif .protocol == "trojan" then
-                {tag:("in-trojan-"+(.listen_port|tostring)), type:"trojan", listen:"::", listen_port:.listen_port,
-                 users:[{"password":$uid}], transport:{"type":"ws","path":.path}}
-            elif .protocol == "reality" then
-                {tag:("in-reality-"+(.listen_port|tostring)), type:"vless", listen:"::", listen_port:.listen_port,
-                 users:[{"uuid":$uid,"flow":"xtls-rprx-vision"}],
-                 tls:{enabled:true, server_name:"www.apple.com",
-                      reality:{enabled:true, handshake:{server:"www.apple.com",server_port:443},
-                               private_key:$rpk, short_id:[$rsid]}}}
-            elif .protocol == "hysteria2" then
-                {tag:("in-hysteria2-"+(.listen_port|tostring)), type:"hysteria2", listen:"::", listen_port:.listen_port, password:$hpass}
-            elif .protocol == "tuic" then
-                {tag:("in-tuic-"+(.listen_port|tostring)), type:"tuic", listen:"::", listen_port:.listen_port, uuid:$uid, password:$tpass, congestion_control:"bbr"}
-            end
-        ]')
+    inbounds=$(echo "$routes_json" | jq --arg uid "$uid" '[
+        .[] | {
+            tag: ("in-" + .protocol + "-" + (.listen_port|tostring)),
+            type: .protocol,
+            listen: "::",
+            listen_port: .listen_port,
+            users: (
+                if .protocol == "trojan" then [{"password":$uid}]
+                else [{"uuid":$uid}]
+                end
+            ),
+            transport: {"type":"ws","path":.path}
+        }
+    ]')
     echo "{\"inbounds\":$inbounds}" > "$conf_dir/inbounds.json"
+
+    # outbounds — 直连
     cat > "$conf_dir/outbounds.json" << 'EOF'
 {"outbounds":[{"type":"direct","tag":"direct"}]}
 EOF
+
+    # route — 不分流，最省内存
     cat > "$conf_dir/route.json" << 'EOF'
 {"route":{"final":"direct"}}
 EOF
-    ok "sing-box 配置已写入 $conf_dir/"
+
+    ok "sing-box 配置已写入 $conf_dir/ (log/dns/inbounds/outbounds/route)"
 }
 
-# ── 链接生成（六协议）────────────────────────────────
-# ★ 修复: 直连协议(reality/hysteria2/tuic)使用外网端口 cf_port，而非内网监听端口
+# ── 订阅链接 ─────────────────────────────────────────
+# 复用 yx-auto.pages.dev 订阅转换服务，生成 vless/vmess/trojan 订阅
+SUB_BASE="https://yx-auto.pages.dev"
 build_link() {
-    local route_json="$1" uid="$2" host="$3" rpub="${4:-}" rsid="${5:-}" hpass="${6:-}" tpass="${7:-}"
-    local proto listen_port ext_port path mode
-    proto=$(echo "$route_json" | jq -r '.protocol')
-    listen_port=$(echo "$route_json" | jq -r '.listen_port')
-    ext_port=$(echo "$route_json" | jq -r '.cf_port')
-    path=$(echo "$route_json" | jq -r '.path // ""')
-    mode=$(echo "$route_json" | jq -r '.mode')
-    case $proto in
-    vless)
-        echo "vless://${uid}@${host}:443?type=ws&path=$(urlencode "$path")&security=tls&sni=${host}#VLESS-WS-${host}"
-        ;;
-    vmess)
-        local vj; vj=$(printf '{"v":"2","ps":"VMess-WS","add":"%s","port":"443","id":"%s","aid":"0","scy":"auto","net":"ws","path":"%s","tls":"tls","sni":"%s"}' "$host" "$uid" "$path" "$host")
-        echo "vmess://$(echo "$vj" | b64)"
-        ;;
-    trojan)
-        echo "trojan://${uid}@${host}:443?type=ws&path=$(urlencode "$path")&security=tls&sni=${host}#Trojan-WS-${host}"
-        ;;
-    reality)
-        # 直连协议用外网端口 ext_port
-        echo "vless://${uid}@${host}:${ext_port}?security=reality&sni=www.apple.com&pbk=${rpub}&sid=${rsid}&fp=chrome&flow=xtls-rprx-vision#VLESS-Reality-${ext_port}"
-        ;;
-    hysteria2)
-        echo "hysteria2://${hpass}@${host}:${ext_port}/?insecure=1#Hysteria2-${ext_port}"
-        ;;
-    tuic)
-        echo "tuic://${uid}:${tpass}@${host}:${ext_port}/?congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#TUICv5-${ext_port}"
-        ;;
-    esac
+    local uid="$1" domain="$2" proto="$3" path="$4"
+    local ev="no" et="no" evm="no"
+    case "$proto" in vless) ev="yes";; trojan) et="yes";; vmess) evm="yes";; esac
+    echo "${SUB_BASE}/${uid}/sub?domain=${domain}&epd=yes&epi=yes&egi=no&dkby=yes&ev=${ev}&et=${et}&mess=${evm}&path=$(urlencode "$path")"
 }
 gen_all_links() {
-    local routes_json="$1" uid="$2" host="$3" rpub="${4:-}" rsid="${5:-}" hpass="${6:-}" tpass="${7:-}"
-    local links_json='{}' count i route_json link proto
-    count=$(echo "$routes_json" | jq 'length')
-    for ((i=0; i<count; i++)); do
-        route_json=$(echo "$routes_json" | jq ".[$i]")
-        proto=$(echo "$route_json" | jq -r '.protocol')
-        link=$(build_link "$route_json" "$uid" "$host" "$rpub" "$rsid" "$hpass" "$tpass")
+    local uid="$1" domain="$2" routes_json="$3"
+    local links_json='{}'
+    local proto path link
+    while IFS=$'\t' read -r proto path; do
+        link=$(build_link "$uid" "$domain" "$proto" "$path")
         links_json=$(echo "$links_json" | jq --arg p "$proto" --arg l "$link" '. + {($p):$l}')
-    done
+    done < <(echo "$routes_json" | jq -r '.[] | [.protocol, .path] | @tsv')
     echo "$links_json"
 }
 
@@ -485,40 +552,31 @@ save_state() { mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"; echo "$1" > "$ST
 remove_state() { rm -f "$STATE_PATH"; }
 save_links_snapshot() {
     local domain="$1" uid="$2" links_json="$3"
-    { echo "域名/IP: $domain"; echo "UUID: $uid"; echo
+    { echo "域名: $domain"; echo "UUID: $uid"; echo
       echo "$links_json" | jq -r 'to_entries[] | "\(.key) \(.value)"'
     } > "$LAST_LINKS_PATH"
     chmod 600 "$LAST_LINKS_PATH"
 }
 print_links() {
-    local links_json="$1" proto link
+    local links_json="$1"
+    local proto link
     while IFS=$'\t' read -r proto link; do
-        echo "  ${PROTO_LABEL[$proto]:-$proto}  $link"
+        echo "  ${PROTO_LABEL[$proto]:-$proto}订阅 $link"
     done < <(echo "$links_json" | jq -r 'to_entries[] | [.key, .value] | @tsv')
 }
 
 # ── 交互辅助 ─────────────────────────────────────────
 prompt_protocols() {
-    echo ""
-    echo "  ═══ 协议选择（逗号分隔，可自由组合）═══"
-    echo "    走 Cloudflare (TCP/WS):"
-    echo "      1 = VLESS+WS    2 = Trojan+WS    3 = VMess+WS"
-    echo "    直连 IP (不走 CF):"
-    echo "      4 = VLESS-Reality    5 = Hysteria2    6 = TUIC v5"
-    echo ""
-    echo "  示例: 输入 1,4  = VLESS+WS走CF + Reality直连"
-    echo "        输入 4,5,6 = 三个直连协议，不需要CF"
-    echo "        输入 1,2,3 = 三个WS协议全部走CF"
-    read -rp "选择协议编号(留空=1,2,3): " proto_raw
+    read -rp "创建协议(1=vless,2=trojan,3=vmess，逗号分隔，留空=全部): " proto_raw
     local protocols=()
     if [[ -z "$proto_raw" ]]; then
         protocols=(vless trojan vmess)
     else
-        local -A pmap=([1]=vless [2]=trojan [3]=vmess [4]=reality [5]=hysteria2 [6]=tuic)
+        local -A pmap=([1]=vless [2]=trojan [3]=vmess [vless]=vless [trojan]=trojan [vmess]=vmess)
         IFS=',' read -ra tokens <<< "$proto_raw"
         for t in "${tokens[@]}"; do
-            t="${t// /}"
-            [[ -n "${pmap[$t]:-}" ]] || die "未知协议编号: $t (可选1-6)"
+            t="${t,,}"; t="${t// /}"
+            [[ -n "${pmap[$t]:-}" ]] || die "未知协议: $t"
             protocols+=("${pmap[$t]}")
         done
     fi
@@ -536,215 +594,215 @@ prompt_uuid() {
     echo "$uid"
 }
 prompt_path_prefix() {
-    local default="$1" pfx
+    local default="$1"
     read -rp "WS 路径前缀(留空=/${default}): " pfx
     [[ -z "$pfx" ]] && pfx="/${default}"
     [[ "$pfx" == /* ]] || pfx="/${pfx}"
     echo "$pfx"
 }
-has_cf_proto() { echo "$1" | jq -e '[.[] | select(.mode=="cf")] | length > 0' >/dev/null 2>&1; }
-
-# ★ 重写: 逐个协议单独配置端口，NAT模式下分别问内网和外网端口
 build_routes() {
-    local net_mode="$1" path_prefix="$2"; shift 2
+    local net_mode="$1" path_prefix="$2" proto_count="$3"
+    shift 3
     local protocols=("$@")
-    local routes_json='[]' existing_ports
-    existing_ports=$(get_listening_ports)
-
-    echo ""
+    local routes_json='[]'
     if [[ "$net_mode" == "nat" ]]; then
-        info "NAT 模式: 逐个协议配置 内网监听端口 和 外网映射端口"
+        echo >&2
+        info "NAT 模式: 逐个配置每个协议的端口映射" >&2
+        echo >&2
+        for proto in "${protocols[@]}"; do
+            local int_port ext_port
+            read -rp "${proto} 内部监听端口(sing-box监听): " int_port
+            [[ "$int_port" =~ ^[0-9]+$ ]] || die "无效端口: $int_port"
+            read -rp "${proto} 外部映射端口(对外暴露): " ext_port
+            [[ "$ext_port" =~ ^[0-9]+$ ]] || die "无效端口: $ext_port"
+            local path="${path_prefix}-${PROTO_SUFFIX[$proto]}"
+            routes_json=$(echo "$routes_json" | jq \
+                --arg p "$proto" --argjson lp "$((int_port))" --argjson cp "$((ext_port))" --arg pa "$path" \
+                '. + [{protocol:$p, listen_port:$lp, cf_port:$cp, path:$pa}]')
+        done
     else
-        info "直连模式: 逐个协议配置监听端口（内网=外网）"
-    fi
-    echo ""
-
-    for proto in "${protocols[@]}"; do
-        local mode="${PROTO_MODE[$proto]}"
-        local label="${PROTO_LABEL[$proto]}"
-        local listen_port ext_port path=""
-
-        if [[ "$net_mode" == "nat" ]]; then
-            # NAT模式: 分别问内网和外网端口
-            while true; do
-                read -rp "  [$label] 内网监听端口(sing-box实际监听): " listen_port
-                [[ "$listen_port" =~ ^[0-9]+$ ]] && break
-                echo "    请输入数字端口"
-            done
-            while true; do
-                read -rp "  [$label] 外网映射端口(路由器/防火墙对外暴露): " ext_port
-                [[ "$ext_port" =~ ^[0-9]+$ ]] && break
-                echo "    请输入数字端口"
-            done
-        else
-            # 直连模式: 单个端口，回车随机
-            read -rp "  [$label] 监听端口(留空=随机): " listen_port
-            if [[ -z "$listen_port" ]]; then
-                listen_port=$(rand_port "$existing_ports")
+        read -rp "自定义端口?(逗号分隔，留空=随机): " custom_ports_raw
+        local existing_ports
+        existing_ports=$(get_listening_ports)
+        local custom_ports=()
+        if [[ -n "$custom_ports_raw" ]]; then
+            IFS=',' read -ra custom_ports <<< "$custom_ports_raw"
+            [[ ${#custom_ports[@]} -eq $proto_count ]] || die "端口数量与协议数不一致"
+        fi
+        local pi=0
+        for proto in "${protocols[@]}"; do
+            local port
+            if [[ ${#custom_ports[@]} -gt 0 ]]; then
+                port="${custom_ports[$pi]// /}"
+                [[ "$port" =~ ^[0-9]+$ ]] || die "无效端口: $port"
             else
-                [[ "$listen_port" =~ ^[0-9]+$ ]] || die "无效端口: $listen_port"
+                port=$(rand_port "$existing_ports")
             fi
-            ext_port="$listen_port"
-        fi
-        existing_ports="$existing_ports $listen_port"
-
-        # CF类协议需要WS路径
-        if [[ "$mode" == "cf" ]]; then
-            path="${path_prefix}-${PROTO_SUFFIX[$proto]}"
-        fi
-
-        routes_json=$(echo "$routes_json" | jq \
-            --arg p "$proto" --arg m "$mode" \
-            --argjson lp "$((listen_port))" --argjson cp "$((ext_port))" --arg pa "$path" \
-            '. + [{protocol:$p, mode:$m, listen_port:$lp, cf_port:$cp, path:$pa}]')
-    done
+            existing_ports="$existing_ports $port"
+            local path="${path_prefix}-${PROTO_SUFFIX[$proto]}"
+            routes_json=$(echo "$routes_json" | jq \
+                --arg p "$proto" --argjson lp "$((port))" --arg pa "$path" \
+                '. + [{protocol:$p, listen_port:$lp, cf_port:$lp, path:$pa}]')
+            pi=$((pi + 1))
+        done
+    fi
     echo "$routes_json"
 }
 
 # ── 1. 安装 ──────────────────────────────────────────
 do_install() {
-    local state; state=$(load_state 2>/dev/null || true)
-    [[ -n "$state" ]] && die "检测到上次配置，请先卸载"
+    local state
+    state=$(load_state 2>/dev/null || true)
+    [[ -n "$state" ]] && die "检测到上次配置($(echo "$state" | jq -r '.domain // "?"'))，请先卸载"
+
+    # 64M 小鸡优化：先加 swap
     ensure_swap
+
     [[ -f "$SINGBOX_BINARY" ]] && ok "sing-box 已安装" || install_singbox
-    local net_mode; net_mode=$(prompt_net_mode "$(detect_nat)")
+
+    local net_mode
+    net_mode=$(prompt_net_mode "$(detect_nat)")
     ok "网络模式: $(net_mode_label "$net_mode")"
+    prompt_cf
 
-    local protocols_str; protocols_str=$(prompt_protocols)
-    read -ra protocols <<< "$protocols_str"
-
-    local need_cf=false
-    for p in "${protocols[@]}"; do [[ "${PROTO_MODE[$p]}" == "cf" ]] && need_cf=true; done
-
-    local domain="" zone_id=""
-    if $need_cf; then
-        prompt_cf
-        while true; do
-            read -rp "绑定域名(用于CF): " domain || die "输入已中断"
-            [[ -z "$domain" ]] && { echo "域名不能为空"; continue; }
-            if zone_id=$(cf_find_zone "$domain"); then info "匹配到 Zone: $zone_id"; break; fi
-            echo "无法匹配 Zone，请确认域名已托管"
-        done
-    else
-        info "仅直连类协议，无需 Cloudflare，直接用公网 IP"
-    fi
-
-    local uid; uid=$(prompt_uuid)
-    local reality_private="" reality_public="" reality_sid="" hysteria2_pass="" tuic_pass=""
-    for p in "${protocols[@]}"; do
-        case $p in
-        reality) gen_reality_keypair; reality_sid=$(gen_shortid); ok "Reality 密钥已生成" ;;
-        hysteria2) hysteria2_pass=$(gen_rand_pass); ok "Hysteria2 密码已生成" ;;
-        tuic) tuic_pass=$(gen_rand_pass); ok "TUIC 密码已生成" ;;
-        esac
+    local domain zone_id
+    while true; do
+        read -rp "绑定域名: " domain || die "输入已中断"
+        if [[ -z "$domain" ]]; then
+            echo "域名不能为空，请重试"
+            continue
+        fi
+        if zone_id=$(cf_find_zone "$domain"); then
+            info "匹配到 Zone: $zone_id"
+            break
+        fi
+        echo "无法在该 CF 账号下匹配 Zone: $domain，请确认域名已托管并重输（Ctrl+C 退出）"
     done
 
-    local path_prefix=""
-    if $need_cf; then path_prefix=$(prompt_path_prefix "${uid:0:8}"); fi
+    local protocols_str
+    protocols_str=$(prompt_protocols)
+    read -ra protocols <<< "$protocols_str"
+    local uid
+    uid=$(prompt_uuid)
+    local short_id="${uid:0:8}"
+    local path_prefix
+    path_prefix=$(prompt_path_prefix "$short_id")
+    local routes_json
+    routes_json=$(build_routes "$net_mode" "$path_prefix" "${#protocols[@]}" "${protocols[@]}")
 
-    local routes_json; routes_json=$(build_routes "$net_mode" "$path_prefix" "${protocols[@]}")
-
-    echo ""; echo "═══ 配置预览 ═══"
-    [[ -n "$domain" ]] && echo "  域名:    $domain"
-    echo "  UUID:    $uid"
-    echo "  模式:    $(net_mode_label "$net_mode")"
-    echo ""
-    echo "$routes_json" | jq -r '.[] | "  [\(.protocol)] 模式:\(.mode)  内网:\(.listen_port)  外网:\(.cf_port)  路径:\(.path//"(无)")"'
-    echo ""
-    [[ -n "$reality_public" ]] && echo "  Reality公钥: $reality_public"
-    [[ -n "$hysteria2_pass" ]] && echo "  Hysteria2密码: $hysteria2_pass"
-    [[ -n "$tuic_pass" ]] && echo "  TUIC密码: $tuic_pass"
-    echo ""
+    echo
+    echo "配置预览:"
+    echo "  域名:  $domain"
+    echo "  UUID:  $uid"
+    echo "  模式:  $net_mode"
+    echo "$routes_json" | jq -r '.[] | "  \(.protocol)  监听:\(.listen_port)  CF端口:\(.cf_port)  路径:\(.path)"'
+    echo
     read -rp "确认部署? (Y/n): " confirm
     [[ "${confirm,,}" =~ ^(|y|yes)$ ]] || die "已取消"
 
-    gen_singbox_config "$routes_json" "$uid" "$reality_private" "$reality_sid" "$hysteria2_pass" "$tuic_pass"
+    # sing-box 配置 + 启动
+    gen_singbox_config "$routes_json" "$uid"
     [[ "$INIT_SYSTEM" == "openrc" && ! -f "$SINGBOX_OPENRC_SCRIPT" ]] && write_openrc_script && ok "OpenRC 服务脚本已创建"
     restart_singbox
 
-    local public_ip; public_ip=$(get_public_ip)
-    local dns_before="null" ssl_before="" origin_rules_before="[]" dns_record_id="" security_backup="null"
-    if $need_cf; then
-        dns_before=$(cf_get_dns "$zone_id" "$domain" || echo "null")
-        [[ "$dns_before" == "" ]] && dns_before="null"
-        ssl_before=$(cf_get_ssl "$zone_id")
-        origin_rules_before=$(cf_get_origin_rules "$zone_id")
-        dns_record_id=$(cf_upsert_dns "$zone_id" "$domain" "$public_ip")
-        ok "DNS A 记录: $domain -> $public_ip (已代理)"
-        cf_set_ssl "$zone_id" "flexible"
-        ok "SSL 模式: flexible (CF边缘TLS)"
-        local cf_routes; cf_routes=$(echo "$routes_json" | jq '[.[] | select(.mode=="cf")]')
-        apply_origin_rules "$zone_id" "$domain" "$cf_routes"
-        ok "Origin Rules: $(echo "$cf_routes" | jq 'length') 条"
-        security_backup=$(cf_relax_security "$zone_id")
-    fi
+    # CF 配置
+    local public_ip dns_before ssl_before origin_rules_before dns_record_id
+    public_ip=$(get_public_ip)
+    dns_before=$(cf_get_dns "$zone_id" "$domain" || echo "null")
+    [[ "$dns_before" == "" ]] && dns_before="null"
+    ssl_before=$(cf_get_ssl "$zone_id")
+    origin_rules_before=$(cf_get_origin_rules "$zone_id")
+    dns_record_id=$(cf_upsert_dns "$zone_id" "$domain" "$public_ip")
+    ok "DNS A 记录: $domain -> $public_ip (已代理)"
+    cf_set_ssl "$zone_id" "flexible"
+    ok "SSL 模式: flexible (CF边缘TLS，源站WS明文)"
+    apply_origin_rules "$zone_id" "$domain" "$routes_json"
+    ok "Origin Rules: ${#protocols[@]} 条 (按WS路径转发到对应端口)"
 
-    local host; $need_cf && host="$domain" || host="$public_ip"
-    local links_json; links_json=$(gen_all_links "$routes_json" "$uid" "$host" "$reality_public" "$reality_sid" "$hysteria2_pass" "$tuic_pass")
-    save_links_snapshot "$host" "$uid" "$links_json"
+    # 安全规则：关闭可能拦截 WS 的设置
+    local security_backup
+    security_backup=$(cf_relax_security "$zone_id")
 
-    local dns_existed="false"; [[ "$dns_before" != "null" ]] && dns_existed="true"
+    # 订阅
+    local links_json
+    links_json=$(gen_all_links "$uid" "$domain" "$routes_json")
+    save_links_snapshot "$domain" "$uid" "$links_json"
+
+    # 状态保存
+    local dns_existed="false"
+    [[ "$dns_before" != "null" ]] && dns_existed="true"
+    [[ -n "$dns_before" ]]          || dns_before="null"
+    [[ -n "$origin_rules_before" ]] || origin_rules_before="[]"
+    [[ -n "$security_backup" ]]     || security_backup="null"
+    [[ -n "$links_json" ]]          || links_json="{}"
+    [[ -n "$routes_json" ]]         || routes_json="[]"
     save_state "$(jq -n \
-        --arg d "$domain" --arg z "$zone_id" --arg u "$uid" --arg mode "$net_mode" \
+        --arg d "$domain" --arg z "$zone_id" --arg u "$uid" --arg s "$short_id" --arg mode "$net_mode" \
         --argjson routes "$routes_json" \
         --arg drid "$dns_record_id" --argjson dex "$dns_existed" --argjson drec "$dns_before" \
         --arg ssl "$ssl_before" --argjson orbk "$origin_rules_before" --argjson links "$links_json" \
         --argjson secbk "$security_backup" \
-        --arg rpk "$reality_private" --arg rpub "$reality_public" --arg rsid "$reality_sid" \
-        --arg hpass "$hysteria2_pass" --arg tpass "$tuic_pass" \
-        '{domain:$d,zone_id:$z,uuid:$u,net_mode:$mode,routes:$routes,
+        '{domain:$d,zone_id:$z,uuid:$u,short_id:$s,net_mode:$mode,routes:$routes,
           managed_dns_record_id:$drid,dns_backup:{existed:$dex,record:$drec},
-          ssl_backup:$ssl,origin_rules_backup:$orbk,security_backup:$secbk,links:$links,
-          reality_private:$rpk,reality_public:$rpub,reality_sid:$rsid,hysteria2_pass:$hpass,tuic_pass:$tpass}')"
+          ssl_backup:$ssl,origin_rules_backup:$orbk,security_backup:$secbk,links:$links}')"
 
-    echo ""; ok "部署完成"; echo ""
+    echo
+    ok "部署完成"
     print_links "$links_json"
-    echo ""; echo "节点链接已保存到 $LAST_LINKS_PATH"
-    $need_cf && { echo ""; echo "CF类协议客户端: 地址=$domain 端口=443 TLS=开启 SNI=$domain 网络=WS"; }
-    echo ""; echo "⚠ Hysteria2/TUIC 为 UDP 协议，需确保安全组/防火墙放行对应 UDP 外网端口"
+    echo
+    echo "订阅已保存到 $LAST_LINKS_PATH"
+    echo
+    echo "客户端配置要点:"
+    echo "  地址: $domain  端口: 443  TLS: 开启  SNI: $domain"
+    echo "  网络: WS  路径: 对应协议的 path (见上)"
+    echo "  Trojan 同样走 WS over CF，客户端需支持 Trojan+WS"
 }
 
 # ── 2. 卸载 ──────────────────────────────────────────
 do_uninstall() {
-    local state; state=$(load_state 2>/dev/null || true)
+    local state
+    state=$(load_state 2>/dev/null || true)
     [[ -n "$state" ]] || die "未检测到上次配置"
-    local domain; domain=$(echo "$state" | jq -r '.domain // "直连模式"')
+    local domain; domain=$(echo "$state" | jq -r '.domain')
     echo "正在卸载: $domain"
-    svc_stop; rm -rf "$SINGBOX_CONF_DIR"
+    stop_singbox; rm -rf "$SINGBOX_CONF_DIR"
     ok "sing-box 已停止"
-    if load_cf_account && [[ -n "$(echo "$state" | jq -r '.zone_id // ""')" ]]; then
-        local zone_id; zone_id=$(echo "$state" | jq -r '.zone_id')
-        cf_put_origin_rules "$zone_id" "$(echo "$state" | jq '.origin_rules_backup // []')"
-        ok "Origin Rules 已恢复"
-        local ssl_bk; ssl_bk=$(echo "$state" | jq -r '.ssl_backup // ""')
-        [[ -n "$ssl_bk" ]] && cf_set_ssl "$zone_id" "$ssl_bk" && ok "SSL: $ssl_bk"
-        local dns_existed record_id
-        dns_existed=$(echo "$state" | jq -r '.dns_backup.existed')
-        record_id=$(echo "$state" | jq -r '.managed_dns_record_id // ""')
-        if [[ "$dns_existed" == "true" ]]; then
-            local rp; rp=$(echo "$state" | jq '.dns_backup.record | {type:(.type//"A"),name:(.name//""),content:(.content//""),proxied:(.proxied//false),ttl:(.ttl//1)}')
-            cf_call PUT "/zones/${zone_id}/dns_records/${record_id}" "$rp" >/dev/null
-            ok "DNS 已恢复"
-        elif [[ -n "$record_id" ]]; then
-            cf_call_raw DELETE "/zones/${zone_id}/dns_records/${record_id}" >/dev/null 2>&1 || true
-            ok "DNS 已删除"
+    if load_cf_account; then
+        local zone_id; zone_id=$(echo "$state" | jq -r '.zone_id // ""')
+        if [[ -n "$zone_id" ]]; then
+            cf_put_origin_rules "$zone_id" "$(echo "$state" | jq '.origin_rules_backup // []')"
+            ok "Origin Rules 已恢复"
+            local ssl_bk; ssl_bk=$(echo "$state" | jq -r '.ssl_backup // ""')
+            [[ -n "$ssl_bk" ]] && cf_set_ssl "$zone_id" "$ssl_bk" && ok "SSL: $ssl_bk"
+            local dns_existed record_id
+            dns_existed=$(echo "$state" | jq -r '.dns_backup.existed')
+            record_id=$(echo "$state" | jq -r '.managed_dns_record_id // ""')
+            if [[ "$dns_existed" == "true" ]]; then
+                local rp; rp=$(echo "$state" | jq '.dns_backup.record | {type:(.type//"A"),name:(.name//""),content:(.content//""),proxied:(.proxied//false),ttl:(.ttl//1)}')
+                cf_call PUT "/zones/${zone_id}/dns_records/${record_id}" "$rp" >/dev/null
+                ok "DNS 已恢复"
+            elif [[ -n "$record_id" ]]; then
+                cf_call_raw DELETE "/zones/${zone_id}/dns_records/${record_id}" >/dev/null 2>&1 || true
+                ok "DNS 已删除"
+            fi
+            local sec_bk; sec_bk=$(echo "$state" | jq '.security_backup // null')
+            cf_restore_security "$zone_id" "$sec_bk"
         fi
-        cf_restore_security "$zone_id" "$(echo "$state" | jq '.security_backup // null')"
     else
-        echo "无 CF 凭据，跳过 CF 恢复"
+        echo "无 CF 凭据，跳过恢复"
     fi
     remove_state
     rm -f "$LAST_LINKS_PATH" "$CF_ACCOUNT_PATH"
-    ok "已清理状态文件"
+    ok "已清理订阅快照与 CF 凭据"
     ok "卸载完成"
 }
 
-# ── 3. 查看节点链接 ──────────────────────────────────
+# ── 3. 查看订阅 ──────────────────────────────────────
 do_show() {
     if [[ -f "$LAST_LINKS_PATH" ]]; then cat "$LAST_LINKS_PATH"; return; fi
     local state; state=$(load_state 2>/dev/null || true)
-    [[ -n "$state" ]] || die "无历史配置"
-    echo "域名/IP: $(echo "$state" | jq -r '.domain // "直连"')"
+    [[ -n "$state" ]] || die "无历史订阅"
+    echo "域名: $(echo "$state" | jq -r '.domain')"
     echo "UUID: $(echo "$state" | jq -r '.uuid')"
     echo "$state" | jq -r '.links | to_entries[] | "\(.key) \(.value)"'
 }
@@ -753,33 +811,26 @@ do_show() {
 do_modify() {
     local state; state=$(load_state 2>/dev/null || true)
     [[ -n "$state" ]] || die "未检测到部署"
-    local domain uid routes_json net_mode rpk rpub rsid hpass tpass zone_id
-    domain=$(echo "$state" | jq -r '.domain // ""')
+    local domain uid routes_json net_mode
+    domain=$(echo "$state" | jq -r '.domain')
     uid=$(echo "$state" | jq -r '.uuid')
     routes_json=$(echo "$state" | jq '.routes')
     net_mode=$(echo "$state" | jq -r '.net_mode // "direct"')
-    zone_id=$(echo "$state" | jq -r '.zone_id // ""')
-    rpk=$(echo "$state" | jq -r '.reality_private // ""')
-    rpub=$(echo "$state" | jq -r '.reality_public // ""')
-    rsid=$(echo "$state" | jq -r '.reality_sid // ""')
-    hpass=$(echo "$state" | jq -r '.hysteria2_pass // ""')
-    tpass=$(echo "$state" | jq -r '.tuic_pass // ""')
-
-    echo ""; echo "当前配置 ($(net_mode_label "$net_mode")):"
-    [[ -n "$domain" ]] && echo "  域名: $domain"
-    echo "  UUID: $uid"
-    echo "$routes_json" | jq -r '.[] | "  [\(.protocol)] 内网:\(.listen_port) 外网:\(.cf_port) 路径:\(.path//"(无)")"'
-    echo ""
+    echo
+    echo "当前配置 ($net_mode):"
+    echo "  域名: $domain  UUID: $uid"
+    echo "$routes_json" | jq -r '.[] | "  \(.protocol)  监听:\(.listen_port)  CF端口:\(.cf_port)  路径:\(.path)"'
+    echo
     echo "  1. 修改 UUID"
-    echo "  2. 修改端口（逐个协议改内网/外网）"
-    echo "  3. 修改 WS 路径(仅CF类)"
+    echo "  2. 修改端口"
+    echo "  3. 修改 WS 路径"
     echo "  4. 全部修改"
     echo "  0. 返回"
+    echo
     read -rp "请选择 [0-4]: " mc
     local new_uid="$uid" new_routes="$routes_json" changed=false
     [[ "$mc" =~ ^[0-4]$ ]] || die "无效选项"
     [[ "$mc" == "0" ]] && return
-
     if [[ "$mc" == "1" || "$mc" == "4" ]]; then
         read -rp "新 UUID(留空=重新生成): " iu
         if [[ -n "$iu" ]]; then
@@ -790,56 +841,59 @@ do_modify() {
         fi
         changed=true; ok "UUID: $new_uid"
     fi
-
     if [[ "$mc" == "2" || "$mc" == "4" ]]; then
         local pc; pc=$(echo "$new_routes" | jq 'length')
-        echo ""
-        info "逐个协议修改端口（留空=不改）"
-        local idx=0
-        for ((idx=0; idx<pc; idx++)); do
-            local proto cur_lp cur_cp label
-            proto=$(echo "$new_routes" | jq -r ".[$idx].protocol")
-            cur_lp=$(echo "$new_routes" | jq -r ".[$idx].listen_port")
-            cur_cp=$(echo "$new_routes" | jq -r ".[$idx].cf_port")
-            label="${PROTO_LABEL[$proto]:-$proto}"
-            if [[ "$net_mode" == "nat" ]]; then
-                read -rp "  [$label] 内网端口(当前=$cur_lp, 留空不改): " nl
-                read -rp "  [$label] 外网端口(当前=$cur_cp, 留空不改): " nc
-                [[ -n "$nl" ]] && { [[ "$nl" =~ ^[0-9]+$ ]] || die "无效端口: $nl"; new_routes=$(echo "$new_routes" | jq --argjson i $idx --argjson v "$((nl))" '.[$i].listen_port=$v'); }
-                [[ -n "$nc" ]] && { [[ "$nc" =~ ^[0-9]+$ ]] || die "无效端口: $nc"; new_routes=$(echo "$new_routes" | jq --argjson i $idx --argjson v "$((nc))" '.[$i].cf_port=$v'); }
-            else
-                read -rp "  [$label] 端口(当前=$cur_lp, 留空不改): " np
-                if [[ -n "$np" ]]; then
-                    [[ "$np" =~ ^[0-9]+$ ]] || die "无效端口: $np"
-                    new_routes=$(echo "$new_routes" | jq --argjson i $idx --argjson v "$((np))" '.[$i].listen_port=$v|.[$i].cf_port=$v')
-                fi
+        if [[ "$net_mode" == "nat" ]]; then
+            echo "当前映射: $(echo "$new_routes" | jq -r '[.[] | "\(.listen_port):\(.cf_port)"] | join(",")')"
+            read -rp "新端口映射(内部:外部，共${pc}组，留空=不改): " mr
+            if [[ -n "$mr" ]]; then
+                IFS=',' read -ra maps <<< "$mr"
+                [[ ${#maps[@]} -eq $pc ]] || die "数量不匹配"
+                local idx=0
+                for m in "${maps[@]}"; do
+                    m="${m// /}"; local lp="${m%%:*}" cp="${m##*:}"
+                    [[ "$lp" =~ ^[0-9]+$ && "$cp" =~ ^[0-9]+$ ]] || die "无效: $m"
+                    new_routes=$(echo "$new_routes" | jq --argjson i $idx --argjson l "$((lp))" --argjson c "$((cp))" '.[$i].listen_port=$l|.[$i].cf_port=$c')
+                    idx=$((idx+1))
+                done
+                changed=true; ok "端口已更新"
             fi
-        done
-        changed=true; ok "端口已更新"
+        else
+            echo "当前端口: $(echo "$new_routes" | jq -r '[.[].listen_port|tostring] | join(",")')"
+            read -rp "新端口(逗号分隔，共${pc}个，留空=不改): " pr
+            if [[ -n "$pr" ]]; then
+                IFS=',' read -ra nps <<< "$pr"
+                [[ ${#nps[@]} -eq $pc ]] || die "数量不匹配"
+                local idx=0
+                for np in "${nps[@]}"; do
+                    np="${np// /}"; [[ "$np" =~ ^[0-9]+$ ]] || die "无效: $np"
+                    new_routes=$(echo "$new_routes" | jq --argjson i $idx --argjson p "$((np))" '.[$i].listen_port=$p|.[$i].cf_port=$p')
+                    idx=$((idx+1))
+                done
+                changed=true; ok "端口已更新"
+            fi
+        fi
     fi
-
     if [[ "$mc" == "3" || "$mc" == "4" ]]; then
-        echo "当前路径: $(echo "$new_routes" | jq -r '[.[] | select(.mode=="cf") | .path] | join(", ")')"
+        echo "当前路径: $(echo "$new_routes" | jq -r '[.[].path] | join(", ")')"
         read -rp "新 WS 路径前缀(留空=不改): " np
         if [[ -n "$np" ]]; then
             [[ "$np" == /* ]] || np="/${np}"
-            new_routes=$(echo "$new_routes" | jq --arg pfx "$np" '[.[] | if .mode=="cf" then .path=($pfx+"-"+(if .protocol=="vless" then "vl" elif .protocol=="trojan" then "tr" else "vm" end)) else . end]')
+            new_routes=$(echo "$new_routes" | jq --arg pfx "$np" '[.[]|.path=($pfx+"-"+(if .protocol=="vless" then "vl" elif .protocol=="trojan" then "tr" else "vm" end))]')
             changed=true; ok "路径已更新"
         fi
     fi
-
     [[ "$changed" == "true" ]] || { echo "无修改"; return; }
-    gen_singbox_config "$new_routes" "$new_uid" "$rpk" "$rsid" "$hpass" "$tpass"
+    gen_singbox_config "$new_routes" "$new_uid"
     restart_singbox
-    if has_cf_proto "$new_routes" && load_cf_account && [[ -n "$zone_id" ]]; then
-        local cf_routes; cf_routes=$(echo "$new_routes" | jq '[.[] | select(.mode=="cf")]')
-        apply_origin_rules "$zone_id" "$domain" "$cf_routes"
+    if load_cf_account; then
+        apply_origin_rules "$(echo "$state" | jq -r '.zone_id')" "$domain" "$new_routes"
         ok "Origin Rules 已更新"
     fi
-    local host; [[ -n "$domain" ]] && host="$domain" || host=$(get_public_ip)
-    local links_json; links_json=$(gen_all_links "$new_routes" "$new_uid" "$host" "$rpub" "$rsid" "$hpass" "$tpass")
-    save_links_snapshot "$host" "$new_uid" "$links_json"
-    save_state "$(echo "$state" | jq --arg u "$new_uid" --argjson r "$new_routes" --argjson l "$links_json" '.uuid=$u|.routes=$r|.links=$l')"
+    local links_json; links_json=$(gen_all_links "$new_uid" "$domain" "$new_routes")
+    save_links_snapshot "$domain" "$new_uid" "$links_json"
+    save_state "$(echo "$state" | jq --arg u "$new_uid" --argjson r "$new_routes" --argjson l "$links_json" --arg s "${new_uid:0:8}" \
+        '.uuid=$u|.short_id=$s|.routes=$r|.links=$l')"
     echo; ok "配置已更新"; print_links "$links_json"
 }
 
@@ -847,131 +901,139 @@ do_modify() {
 do_show_config() {
     local state; state=$(load_state 2>/dev/null || true)
     [[ -n "$state" ]] || die "未检测到部署"
-    echo ""
-    echo "域名/IP: $(echo "$state" | jq -r '.domain // "直连"')"
-    echo "UUID:     $(echo "$state" | jq -r '.uuid')"
-    echo "模式:     $(net_mode_label "$(echo "$state" | jq -r '.net_mode // "direct"')")"
-    echo ""
+    echo
+    echo "域名:  $(echo "$state" | jq -r '.domain')"
+    echo "UUID:  $(echo "$state" | jq -r '.uuid')"
+    echo "模式:  $(echo "$state" | jq -r '.net_mode // "direct"')"
+    echo
     echo "入站:"
-    echo "$state" | jq -r '.routes[] | "  [\(.protocol)] 模式:\(.mode)  内网:\(.listen_port)  外网:\(.cf_port)  路径:\(.path//"(无)")"'
-    local rpub hpass tpass
-    rpub=$(echo "$state" | jq -r '.reality_public // ""')
-    hpass=$(echo "$state" | jq -r '.hysteria2_pass // ""')
-    tpass=$(echo "$state" | jq -r '.tuic_pass // ""')
-    [[ -n "$rpub" ]] && echo "  Reality公钥: $rpub"
-    [[ -n "$hpass" ]] && echo "  Hysteria2密码: $hpass"
-    [[ -n "$tpass" ]] && echo "  TUIC密码: $tpass"
-    echo ""
+    echo "$state" | jq -r '.routes[] | "  \(.protocol)  监听:\(.listen_port)  CF端口:\(.cf_port)  路径:\(.path)"'
+    echo
     echo -n "sing-box: "; svc_is_active && echo "运行中" || echo "未运行"
+    echo
     echo "内存占用:"
     ps -o rss= -C sing-box 2>/dev/null | awk '{sum+=$1} END {printf "  RSS: %.1f MB\n", sum/1024}' || echo "  无法获取"
-    echo ""
-    echo "节点链接:"
+    echo
+    echo "订阅:"
     print_links "$(echo "$state" | jq '.links')"
-    echo ""
+    echo
 }
 
-# ── 6. 更新外部端口（NAT）───────────────────────────
+# ── 6. 更新外部端口（NAT 快捷操作）──────────────────
 do_update_ports() {
     local state; state=$(load_state 2>/dev/null || true)
     [[ -n "$state" ]] || die "未检测到部署"
-    local domain routes_json net_mode zone_id uid
-    domain=$(echo "$state" | jq -r '.domain // ""')
+    local domain routes_json net_mode
+    domain=$(echo "$state" | jq -r '.domain')
     routes_json=$(echo "$state" | jq '.routes')
     net_mode=$(echo "$state" | jq -r '.net_mode // "direct"')
-    zone_id=$(echo "$state" | jq -r '.zone_id // ""')
-    uid=$(echo "$state" | jq -r '.uuid')
-    echo ""; echo "当前端口映射:"
-    echo "$routes_json" | jq -r '.[] | "  [\(.protocol)] 内网:\(.listen_port) -> 外网:\(.cf_port)"'
-    [[ "$net_mode" != "nat" ]] && { info "直连模式请使用 [4.修改配置]"; return; }
+    echo
+    echo "当前端口映射:"
+    echo "$routes_json" | jq -r '.[] | "  \(.protocol)  监听:\(.listen_port) -> 外部:\(.cf_port)"'
+    echo
     local pc; pc=$(echo "$routes_json" | jq 'length')
-    info "NAT 模式: 逐个更新外网端口"
-    local new_routes="$routes_json" idx=0
-    for ((idx=0; idx<pc; idx++)); do
-        local proto old_cp label ne
-        proto=$(echo "$new_routes" | jq -r ".[$idx].protocol")
-        old_cp=$(echo "$new_routes" | jq -r ".[$idx].cf_port")
-        label="${PROTO_LABEL[$proto]:-$proto}"
-        read -rp "  [$label] 新外网端口(当前=$old_cp, 留空不改): " ne
-        [[ -z "$ne" ]] && continue
-        [[ "$ne" =~ ^[0-9]+$ ]] || die "无效端口: $ne"
-        new_routes=$(echo "$new_routes" | jq --argjson i $idx --argjson p "$((ne))" '.[$i].cf_port=$p')
-    done
-    echo ""; echo "更新预览:"
-    echo "$new_routes" | jq -r '.[] | "  [\(.protocol)] 内网:\(.listen_port) -> 外网:\(.cf_port)"'
-    read -rp "确认? (Y/n): " confirm
-    [[ "${confirm,,}" =~ ^(|y|yes)$ ]] || die "已取消"
-    if has_cf_proto "$new_routes" && load_cf_account && [[ -n "$zone_id" ]]; then
-        local cf_routes; cf_routes=$(echo "$new_routes" | jq '[.[] | select(.mode=="cf")]')
-        apply_origin_rules "$zone_id" "$domain" "$cf_routes"
+    if [[ "$net_mode" == "nat" ]]; then
+        info "NAT 模式: 只更新外部端口(CF Origin Rules)，sing-box 监听端口不变"
+        echo
+        local new_routes="$routes_json" idx=0
+        local rows=() row
+        mapfile -t rows < <(echo "$routes_json" | jq -r '.[] | [.protocol, (.cf_port|tostring)] | @tsv')
+        for row in "${rows[@]}"; do
+            local proto="${row%%$'\t'*}" old_cp="${row##*$'\t'}" ne
+            read -rp "${proto} 新外部端口(当前=${old_cp}): " ne
+            [[ -n "$ne" ]] || die "不能为空"
+            [[ "$ne" =~ ^[0-9]+$ ]] || die "无效端口: $ne"
+            new_routes=$(echo "$new_routes" | jq --argjson i $idx --argjson p "$((ne))" '.[$i].cf_port=$p')
+            idx=$((idx+1))
+        done
+        echo
+        echo "更新预览:"
+        echo "$new_routes" | jq -r '.[] | "  \(.protocol)  监听:\(.listen_port) -> 外部:\(.cf_port)"'
+        read -rp "确认? (Y/n): " confirm
+        [[ "${confirm,,}" =~ ^(|y|yes)$ ]] || die "已取消"
+        load_cf_account || die "未找到 CF 凭据"
+        apply_origin_rules "$(echo "$state" | jq -r '.zone_id')" "$domain" "$new_routes"
         ok "Origin Rules 已更新"
+        local public_ip; public_ip=$(get_public_ip)
+        local zone_id; zone_id=$(echo "$state" | jq -r '.zone_id')
+        local current_dns; current_dns=$(cf_get_dns "$zone_id" "$domain")
+        local current_ip; current_ip=$(echo "$current_dns" | jq -r '.content // ""')
+        if [[ "$current_ip" != "$public_ip" ]]; then
+            cf_upsert_dns "$zone_id" "$domain" "$public_ip" >/dev/null
+            ok "DNS 已更新: $domain -> $public_ip"
+        fi
+        local uid; uid=$(echo "$state" | jq -r '.uuid')
+        local links_json; links_json=$(gen_all_links "$uid" "$domain" "$new_routes")
+        save_links_snapshot "$domain" "$uid" "$links_json"
+        save_state "$(echo "$state" | jq --argjson r "$new_routes" --argjson l "$links_json" '.routes=$r|.links=$l')"
+        echo; ok "外部端口已更新"; print_links "$links_json"
+    else
+        info "直连模式: 端口变更需要同时修改 sing-box 监听，请使用 [4.修改配置]"
     fi
-    local host; [[ -n "$domain" ]] && host="$domain" || host=$(get_public_ip)
-    local rpub rsid hpass tpass
-    rpub=$(echo "$state" | jq -r '.reality_public // ""')
-    rsid=$(echo "$state" | jq -r '.reality_sid // ""')
-    hpass=$(echo "$state" | jq -r '.hysteria2_pass // ""')
-    tpass=$(echo "$state" | jq -r '.tuic_pass // ""')
-    local links_json; links_json=$(gen_all_links "$new_routes" "$uid" "$host" "$rpub" "$rsid" "$hpass" "$tpass")
-    save_links_snapshot "$host" "$uid" "$links_json"
-    save_state "$(echo "$state" | jq --argjson r "$new_routes" --argjson l "$links_json" '.routes=$r|.links=$l')"
-    echo; ok "外部端口已更新"; print_links "$links_json"
 }
 
-# ── 7. 重启 ──────────────────────────────────────────
-do_restart() { restart_singbox; }
+# ── 7. 重启 sing-box ─────────────────────────────────
+do_restart() {
+    if ! svc_is_active; then
+        echo "sing-box 当前未运行，正在启动..."
+    else
+        echo "正在重启 sing-box..."
+    fi
+    restart_singbox
+}
 
 # ── 8. 切换网络模式 ──────────────────────────────────
 do_switch_net_mode() {
     local state; state=$(load_state 2>/dev/null || true)
     [[ -n "$state" ]] || die "未检测到部署"
     local domain zone_id uid cur routes_json
-    domain=$(echo "$state" | jq -r '.domain // ""')
-    zone_id=$(echo "$state" | jq -r '.zone_id // ""')
+    domain=$(echo "$state" | jq -r '.domain')
+    zone_id=$(echo "$state" | jq -r '.zone_id')
     uid=$(echo "$state" | jq -r '.uuid')
     cur=$(echo "$state" | jq -r '.net_mode // "direct"')
     routes_json=$(echo "$state" | jq '.routes')
-    echo ""; echo "当前模式: $(net_mode_label "$cur")"
-    echo "$routes_json" | jq -r '.[] | "  [\(.protocol)] 内网:\(.listen_port) 外网:\(.cf_port)"'
-    local target; [[ "$cur" == "nat" ]] && target="direct" || target="nat"
+    echo
+    echo "当前模式: $(net_mode_label "$cur")"
+    echo "$routes_json" | jq -r '.[] | "  \(.protocol)  监听:\(.listen_port)  外部:\(.cf_port)"'
+    echo
+    local target
+    if [[ "$cur" == "nat" ]]; then
+        target="direct"
+        echo "切成直连后，对外端口将与 sing-box 监听端口一致。"
+    else
+        target="nat"
+        echo "切成 NAT 后，需要为每个协议指定对外端口（路由器/宿主上映射到监听端口）。"
+    fi
     read -rp "确认切换到 $(net_mode_label "$target")? (y/N): " c
     [[ "${c,,}" =~ ^(y|yes)$ ]] || die "已取消"
     local new_routes="$routes_json"
     if [[ "$target" == "direct" ]]; then
         new_routes=$(echo "$new_routes" | jq '[.[] | .cf_port = .listen_port]')
     else
-        local pc idx
-        pc=$(echo "$new_routes" | jq 'length')
-        info "逐个协议设置外网映射端口"
-        for ((idx=0; idx<pc; idx++)); do
-            local proto lp label ep
-            proto=$(echo "$new_routes" | jq -r ".[$idx].protocol")
-            lp=$(echo "$new_routes" | jq -r ".[$idx].listen_port")
-            label="${PROTO_LABEL[$proto]:-$proto}"
-            read -rp "  [$label] 外网端口(内网=$lp, 回车=相同): " ep
+        local idx=0
+        local rows=() row
+        mapfile -t rows < <(echo "$routes_json" | jq -r '.[] | [.protocol, (.listen_port|tostring)] | @tsv')
+        for row in "${rows[@]}"; do
+            local proto="${row%%$'\t'*}" lp="${row##*$'\t'}" ep
+            read -rp "${proto} 对外端口(监听=${lp}, 回车=相同): " ep
             [[ -n "$ep" ]] || ep="$lp"
             [[ "$ep" =~ ^[0-9]+$ ]] || die "无效端口: $ep"
             new_routes=$(echo "$new_routes" | jq --argjson i $idx --argjson p "$((ep))" '.[$i].cf_port=$p')
+            idx=$((idx+1))
         done
     fi
-    echo ""; echo "更新预览:"
-    echo "$new_routes" | jq -r '.[] | "  [\(.protocol)] 内网:\(.listen_port) 外网:\(.cf_port)"'
+    echo
+    echo "更新预览:"
+    echo "$new_routes" | jq -r '.[] | "  \(.protocol)  监听:\(.listen_port)  外部:\(.cf_port)"'
     read -rp "确认? (Y/n): " confirm
     [[ "${confirm,,}" =~ ^(|y|yes)$ ]] || die "已取消"
-    if has_cf_proto "$new_routes" && load_cf_account && [[ -n "$zone_id" ]]; then
-        local cf_routes; cf_routes=$(echo "$new_routes" | jq '[.[] | select(.mode=="cf")]')
-        apply_origin_rules "$zone_id" "$domain" "$cf_routes"
-        ok "Origin Rules 已更新"
-    fi
-    local host; [[ -n "$domain" ]] && host="$domain" || host=$(get_public_ip)
-    local rpub rsid hpass tpass
-    rpub=$(echo "$state" | jq -r '.reality_public // ""')
-    rsid=$(echo "$state" | jq -r '.reality_sid // ""')
-    hpass=$(echo "$state" | jq -r '.hysteria2_pass // ""')
-    tpass=$(echo "$state" | jq -r '.tuic_pass // ""')
-    local links_json; links_json=$(gen_all_links "$new_routes" "$uid" "$host" "$rpub" "$rsid" "$hpass" "$tpass")
-    save_links_snapshot "$host" "$uid" "$links_json"
-    save_state "$(echo "$state" | jq --arg m "$target" --argjson r "$new_routes" --argjson l "$links_json" '.net_mode=$m|.routes=$r|.links=$l')"
+    load_cf_account || die "未找到 CF 凭据"
+    apply_origin_rules "$zone_id" "$domain" "$new_routes"
+    ok "Origin Rules 已更新"
+    local links_json; links_json=$(gen_all_links "$uid" "$domain" "$new_routes")
+    save_links_snapshot "$domain" "$uid" "$links_json"
+    save_state "$(echo "$state" | jq --arg m "$target" --argjson r "$new_routes" --argjson l "$links_json" \
+        '.net_mode=$m | .routes=$r | .links=$l')"
     echo; ok "已切换到 $(net_mode_label "$target")"; print_links "$links_json"
 }
 
@@ -1001,17 +1063,17 @@ main() {
     fi
     echo
     echo "  sing-box-cf-lite ($INIT_SYSTEM)"
-    echo "  六协议: VLESS+WS | VMess+WS | Trojan+WS (CF) · Reality | Hysteria2 | TUIC v5 (直连)"
+    echo "  三协议: VLESS+WS | VMess+WS | Trojan+WS  ·  CF flexible"
     echo
     echo "  1. 安装节点"
     echo "  2. 卸载"
-    echo "  3. 查看节点链接"
+    echo "  3. 查看订阅"
     echo "  4. 修改配置(UUID/端口/路径)"
     echo "  5. 查看当前配置"
-    echo "  6. 更新外部端口(NAT)"
+    echo "  6. 更新外部端口(NAT换端口)"
     echo "  7. 重启 sing-box"
     echo "  8. 切换网络模式(直连/NAT)"
-    [[ -n "$current_domain" ]] && echo "     (当前: ${current_domain:-直连}${net_mode:+ [$net_mode]})"
+    [[ -n "$current_domain" ]] && echo "     (当前: $current_domain${net_mode:+ [$net_mode]})"
     echo
     read -rp "请选择 [1-8]: " choice
     case "$choice" in
