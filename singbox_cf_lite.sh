@@ -1,5 +1,5 @@
-#!/bin/sh
-# sing-box 6协议一键脚本 (Alpine/OpenRC) - Cloudflare 增强版
+#!/bin/bash
+# sing-box 6协议一键脚本 (全系统通用：Systemd / OpenRC) - Cloudflare 增强版
 # 协议: VLESS+WS | VMess+WS | Trojan+WS (支持CF CDN) | VLESS-Reality | Hysteria2 | TUIC v5
 
 # ── 颜色与全局变量 ──
@@ -17,15 +17,28 @@ CERT_FILE="${CONF_DIR}/cert.pem"
 KEY_FILE="${CONF_DIR}/key.pem"
 CF_API="https://api.cloudflare.com/client/v4"
 MANAGED_PREFIX="sb-cf-lite "
+INIT_SYSTEM=""
 
 if [ "$(id -u)" != "0" ]; then
   echo -e "${RED}✗ 请使用 root 用户运行此脚本！${PLAIN}"
   exit 1
 fi
 
+# ── 初始化系统检测 ──
+detect_init() {
+  if command -v systemctl >/dev/null 2>&1 && systemctl --version >/dev/null 2>&1; then
+    INIT_SYSTEM="systemd"
+  elif command -v rc-service >/dev/null 2>&1; then
+    INIT_SYSTEM="openrc"
+  else
+    echo -e "${RED}✗ 不支持的 init 系统（需要 systemd 或 OpenRC）${PLAIN}"
+    exit 1
+  fi
+}
+
 # ── 基础工具函数 ──
 gen_uuid() {
-  cat /proc/sys/kernel/random/uuid 2>/dev/null || head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n'
+  cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null || head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n'
 }
 
 gen_rand_pass() {
@@ -55,16 +68,23 @@ get_external_ip() {
     || echo "127.0.0.1"
 }
 
-# ── 依赖安装 ──
+# ── 依赖安装 (自动适配各大发行版) ──
 install_dep() {
   local pkgs=""
   command -v jq >/dev/null 2>&1 || pkgs="$pkgs jq"
   command -v curl >/dev/null 2>&1 || pkgs="$pkgs curl"
   if [ -n "$pkgs" ]; then
     echo -e "${YELLOW}· 正在安装依赖: $pkgs ...${PLAIN}"
-    apk update >/dev/null 2>&1
-    # shellcheck disable=SC2086
-    apk add $pkgs >/dev/null 2>&1
+    if command -v apt-get >/dev/null 2>&1; then
+      apt-get update -qq && apt-get install -y -qq $pkgs
+    elif command -v yum >/dev/null 2>&1; then
+      yum install -y $pkgs
+    elif command -v apk >/dev/null 2>&1; then
+      apk update && apk add $pkgs
+    else
+      echo -e "${RED}✗ 无法自动安装依赖，请手动安装 jq 和 curl${PLAIN}"
+      exit 1
+    fi
   fi
 }
 
@@ -78,8 +98,8 @@ download_singbox() {
     echo -e "${YELLOW}· 未设置 SINGBOX_MINI_URL，尝试获取官方最新版...${PLAIN}"
     local arch
     case "$(uname -m)" in
-      x86_64) arch="amd64" ;;
-      aarch64) arch="arm64" ;;
+      x86_64|amd64) arch="amd64" ;;
+      aarch64|arm64) arch="arm64" ;;
       *) echo -e "${RED}✗ 不支持的架构: $(uname -m)${PLAIN}"; exit 1 ;;
     esac
     
@@ -104,9 +124,31 @@ download_singbox() {
   echo -e "${GREEN}· 内核安装完成: $(/usr/bin/sing-box version | head -1)${PLAIN}"
 }
 
-# ── OpenRC 服务 ──
-write_service_openrc() {
-  cat > /etc/init.d/${SERVICE_NAME} <<EOF
+# ── 服务管理 (自动识别 systemd / OpenRC) ──
+setup_service() {
+  if [ "$INIT_SYSTEM" = "systemd" ]; then
+    cat > /etc/systemd/system/${SERVICE_NAME}.service <<EOF
+[Unit]
+Description=sing-box service
+Documentation=https://sing-box.sagernet.org
+After=network.target nss-lookup.target
+
+[Service]
+User=root
+WorkingDirectory=${CONF_DIR}
+ExecStart=/usr/bin/sing-box run -c ${CONF}
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=infinity
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable ${SERVICE_NAME} >/dev/null 2>&1
+    echo -e "${GREEN}· Systemd 服务已创建并设置自启${PLAIN}"
+  elif [ "$INIT_SYSTEM" = "openrc" ]; then
+    cat > /etc/init.d/${SERVICE_NAME} <<EOF
 #!/sbin/openrc-run
 description="sing-box service"
 command="/usr/bin/sing-box"
@@ -119,12 +161,42 @@ depend() {
   need net
 }
 EOF
-  chmod +x /etc/init.d/${SERVICE_NAME}
-  rc-update add ${SERVICE_NAME} default >/dev/null 2>&1
-  echo -e "${GREEN}· OpenRC 服务已创建${PLAIN}"
+    chmod +x /etc/init.d/${SERVICE_NAME}
+    rc-update add ${SERVICE_NAME} default >/dev/null 2>&1
+    echo -e "${GREEN}· OpenRC 服务已创建${PLAIN}"
+  fi
 }
 
-# ── Cloudflare API 封装 ──
+start_service() {
+  if [ "$INIT_SYSTEM" = "systemd" ]; then
+    systemctl restart ${SERVICE_NAME}
+  else
+    rc-service ${SERVICE_NAME} restart
+  fi
+}
+
+stop_service() {
+  if [ "$INIT_SYSTEM" = "systemd" ]; then
+    systemctl stop ${SERVICE_NAME} >/dev/null 2>&1
+    systemctl disable ${SERVICE_NAME} >/dev/null 2>&1
+    rm -f /etc/systemd/system/${SERVICE_NAME}.service
+    systemctl daemon-reload
+  else
+    rc-service ${SERVICE_NAME} stop >/dev/null 2>&1
+    rc-update del ${SERVICE_NAME} default >/dev/null 2>&1
+    rm -f /etc/init.d/${SERVICE_NAME}
+  fi
+}
+
+status_service() {
+  if [ "$INIT_SYSTEM" = "systemd" ]; then
+    systemctl status ${SERVICE_NAME}
+  else
+    rc-service ${SERVICE_NAME} status
+  fi
+}
+
+# ── Cloudflare API 模块 ──
 CF_EMAIL="" CF_KEY=""
 load_cf_account() {
   [ -f "$CF_ACCOUNT_PATH" ] || return 1
@@ -140,7 +212,7 @@ save_cf_account() {
 cf_call() {
   local method="$1" endpoint="$2" data="${3:-}"
   local args=(-s -f -X "$method" -H "X-Auth-Email: $CF_EMAIL" -H "X-Auth-Key: $CF_KEY" -H "Content-Type: application/json")
-  [ -n "$data" ] && args+=("$data") # 修复传参
+  [ -n "$data" ] && args+=("$data")
   curl "${args[@]}" "${CF_API}${endpoint}"
 }
 cf_call_raw() {
@@ -170,10 +242,7 @@ prompt_cf() {
     read CF_EMAIL
     printf "Cloudflare Global API Key: "
     read -r CF_KEY
-    if [ -z "$CF_EMAIL" ] || [ -z "$CF_KEY" ]; then
-      echo "邮箱和 Key 不能为空"
-      continue
-    fi
+    [ -z "$CF_EMAIL" ] || [ -z "$CF_KEY" ] && { echo "不能为空"; continue; }
     printf "正在校验凭据... "
     if cf_verify_credentials; then
       echo -e "${GREEN}通过${PLAIN}"
@@ -245,7 +314,6 @@ gen_config() {
   ws_path="/${uuid}"
   mkdir -p "$CONF_DIR"
 
-  # WS 协议询问是否使用 CF 边缘代理
   if [ "$proto" = "1" ] || [ "$proto" = "2" ] || [ "$proto" = "3" ]; then
     printf "是否通过 Cloudflare (CDN) 隐藏真实 IP？(y/N): "
     read use_cf
@@ -357,7 +425,7 @@ JSON
     ;;
 
   5) # Hysteria2 (UDP)
-    if [ ! -f "$CERT_FILE" ]; then /usr/bin/sing-box generate certificate -c "$CERT_FILE" -k "$KEY_FILE" 2>/dev/null; fi
+    [ ! -f "$CERT_FILE" ] && /usr/bin/sing-box generate certificate -c "$CERT_FILE" -k "$KEY_FILE" 2>/dev/null
     local hy2_pass; hy2_pass=$(gen_rand_pass)
     cat > "$CONF" <<JSON
 {
@@ -380,7 +448,7 @@ JSON
     ;;
 
   6) # TUIC v5 (UDP)
-    if [ ! -f "$CERT_FILE" ]; then /usr/bin/sing-box generate certificate -c "$CERT_FILE" -k "$KEY_FILE" 2>/dev/null; fi
+    [ ! -f "$CERT_FILE" ] && /usr/bin/sing-box generate certificate -c "$CERT_FILE" -k "$KEY_FILE" 2>/dev/null
     local tuic_pass; tuic_pass=$(gen_rand_pass)
     cat > "$CONF" <<JSON
 {
@@ -405,13 +473,11 @@ JSON
     ;;
   esac
 
-  # 配置生效前的 JSON 校验
   if ! jq . "$CONF" >/dev/null 2>&1; then
     echo -e "${RED}✗ 配置文件生成错误！${PLAIN}"
     exit 1
   fi
 
-  # 如果启用了 CF，执行 API 联动
   if [ "$cf_enabled" = "yes" ]; then
     echo -e "${YELLOW}· 正在配置 Cloudflare DNS 及 Origin Rules...${PLAIN}"
     cf_upsert_dns "$zone_id" "$domain" "$ext_ip" >/dev/null
@@ -469,18 +535,15 @@ menu_proto() {
   ext_ip=$(get_external_ip)
   gen_config "$proto_sel" "$lport" "$ext_ip"
 
-  if rc-service ${SERVICE_NAME} status >/dev/null 2>&1; then
-    rc-service ${SERVICE_NAME} restart
-  else
-    rc-service ${SERVICE_NAME} start
-  fi
+  start_service
   echo -e "${GREEN}· sing-box 服务已启动！${PLAIN}"
 }
 
 menu_main() {
+  detect_init
   while true; do
     echo -e "\n  ╔══════════════════════════════════════════╗"
-    echo -e "  ║   ${GREEN}sing-box 6协议 (含Cloudflare支持)${PLAIN}     ║"
+    echo -e "  ║   ${GREEN}sing-box 6协议 (全系统/CF支持)${PLAIN}       ║"
     echo -e "  ╚══════════════════════════════════════════╝\n"
     echo "  1. 安装 / 部署新节点"
     echo "  2. 卸载 sing-box"
@@ -496,19 +559,16 @@ menu_main() {
     1)
       install_dep
       [ ! -f /usr/bin/sing-box ] && download_singbox
-      [ ! -f /etc/init.d/${SERVICE_NAME} ] && write_service_openrc
+      setup_service
       menu_proto
       ;;
     2)
       printf "确认完全卸载？(y/N): "
       read confirm
       if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        rc-service ${SERVICE_NAME} stop 2>/dev/null
-        rc-update del ${SERVICE_NAME} default 2>/dev/null
-        rm -f /etc/init.d/${SERVICE_NAME}
+        stop_service
         rm -rf "$CONF_DIR"
         rm -f /usr/bin/sing-box
-        rm -f /var/log/${SERVICE_NAME}.log
         echo -e "${GREEN}· 卸载完成${PLAIN}"
       else
         echo "· 已取消"
@@ -521,12 +581,11 @@ menu_main() {
       [ -f "$CONF" ] && cat "$CONF" || echo -e "${RED}· 配置文件不存在${PLAIN}"
       ;;
     5)
-      rc-service ${SERVICE_NAME} restart
+      start_service
       echo -e "${GREEN}· 已重启${PLAIN}"
       ;;
     6)
-      rc-service ${SERVICE_NAME} status
-      [ -f "/var/log/${SERVICE_NAME}.log" ] && tail -n 10 /var/log/${SERVICE_NAME}.log
+      status_service
       ;;
     0)
       exit 0
