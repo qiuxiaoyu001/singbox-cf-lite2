@@ -434,11 +434,13 @@ EOF
 }
 
 # ── 链接生成（六协议）────────────────────────────────
+# ★ 修复: 直连协议(reality/hysteria2/tuic)使用外网端口 cf_port，而非内网监听端口
 build_link() {
     local route_json="$1" uid="$2" host="$3" rpub="${4:-}" rsid="${5:-}" hpass="${6:-}" tpass="${7:-}"
-    local proto listen_port path mode
+    local proto listen_port ext_port path mode
     proto=$(echo "$route_json" | jq -r '.protocol')
     listen_port=$(echo "$route_json" | jq -r '.listen_port')
+    ext_port=$(echo "$route_json" | jq -r '.cf_port')
     path=$(echo "$route_json" | jq -r '.path // ""')
     mode=$(echo "$route_json" | jq -r '.mode')
     case $proto in
@@ -453,13 +455,14 @@ build_link() {
         echo "trojan://${uid}@${host}:443?type=ws&path=$(urlencode "$path")&security=tls&sni=${host}#Trojan-WS-${host}"
         ;;
     reality)
-        echo "vless://${uid}@${host}:${listen_port}?security=reality&sni=www.apple.com&pbk=${rpub}&sid=${rsid}&fp=chrome&flow=xtls-rprx-vision#VLESS-Reality-${listen_port}"
+        # 直连协议用外网端口 ext_port
+        echo "vless://${uid}@${host}:${ext_port}?security=reality&sni=www.apple.com&pbk=${rpub}&sid=${rsid}&fp=chrome&flow=xtls-rprx-vision#VLESS-Reality-${ext_port}"
         ;;
     hysteria2)
-        echo "hysteria2://${hpass}@${host}:${listen_port}/?insecure=1#Hysteria2-${listen_port}"
+        echo "hysteria2://${hpass}@${host}:${ext_port}/?insecure=1#Hysteria2-${ext_port}"
         ;;
     tuic)
-        echo "tuic://${uid}:${tpass}@${host}:${listen_port}/??congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#TUICv5-${listen_port}"
+        echo "tuic://${uid}:${tpass}@${host}:${ext_port}/?congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#TUICv5-${ext_port}"
         ;;
     esac
 }
@@ -497,10 +500,16 @@ print_links() {
 # ── 交互辅助 ─────────────────────────────────────────
 prompt_protocols() {
     echo ""
-    echo "  协议选择 (逗号分隔):"
-    echo "    CF类(走Cloudflare):  1=VLESS+WS  2=Trojan+WS  3=VMess+WS"
-    echo "    直连类(IP直达):      4=VLESS-Reality  5=Hysteria2  6=TUIC v5"
-    read -rp "选择协议(留空=1,2,3 全部CF类): " proto_raw
+    echo "  ═══ 协议选择（逗号分隔，可自由组合）═══"
+    echo "    走 Cloudflare (TCP/WS):"
+    echo "      1 = VLESS+WS    2 = Trojan+WS    3 = VMess+WS"
+    echo "    直连 IP (不走 CF):"
+    echo "      4 = VLESS-Reality    5 = Hysteria2    6 = TUIC v5"
+    echo ""
+    echo "  示例: 输入 1,4  = VLESS+WS走CF + Reality直连"
+    echo "        输入 4,5,6 = 三个直连协议，不需要CF"
+    echo "        输入 1,2,3 = 三个WS协议全部走CF"
+    read -rp "选择协议编号(留空=1,2,3): " proto_raw
     local protocols=()
     if [[ -z "$proto_raw" ]]; then
         protocols=(vless trojan vmess)
@@ -509,7 +518,7 @@ prompt_protocols() {
         IFS=',' read -ra tokens <<< "$proto_raw"
         for t in "${tokens[@]}"; do
             t="${t// /}"
-            [[ -n "${pmap[$t]:-}" ]] || die "未知协议编号: $t"
+            [[ -n "${pmap[$t]:-}" ]] || die "未知协议编号: $t (可选1-6)"
             protocols+=("${pmap[$t]}")
         done
     fi
@@ -535,73 +544,60 @@ prompt_path_prefix() {
 }
 has_cf_proto() { echo "$1" | jq -e '[.[] | select(.mode=="cf")] | length > 0' >/dev/null 2>&1; }
 
+# ★ 重写: 逐个协议单独配置端口，NAT模式下分别问内网和外网端口
 build_routes() {
     local net_mode="$1" path_prefix="$2"; shift 2
     local protocols=("$@")
-    local cf_protos=() direct_protos=()
-    for p in "${protocols[@]}"; do
-        [[ "${PROTO_MODE[$p]}" == "cf" ]] && cf_protos+=("$p") || direct_protos+=("$p")
-    done
     local routes_json='[]' existing_ports
     existing_ports=$(get_listening_ports)
 
-    # CF类协议
-    if [[ ${#cf_protos[@]} -gt 0 ]]; then
-        if [[ "$net_mode" == "nat" ]]; then
-            for proto in "${cf_protos[@]}"; do
-                local int_port ext_port
-                read -rp "${PROTO_LABEL[$proto]} 内部监听端口: " int_port
-                [[ "$int_port" =~ ^[0-9]+$ ]] || die "无效端口: $int_port"
-                read -rp "${PROTO_LABEL[$proto]} 外部映射端口(CF回源): " ext_port
-                [[ "$ext_port" =~ ^[0-9]+$ ]] || die "无效端口: $ext_port"
-                local path="${path_prefix}-${PROTO_SUFFIX[$proto]}"
-                routes_json=$(echo "$routes_json" | jq --arg p "$proto" --argjson lp "$((int_port))" --argjson cp "$((ext_port))" --arg pa "$path" \
-                    '. + [{protocol:$p,mode:"cf",listen_port:$lp,cf_port:$cp,path:$pa}]')
-            done
-        else
-            read -rp "CF类协议端口(逗号分隔，${#cf_protos[@]}个，留空=随机): " cf_ports_raw
-            local cf_ports=()
-            [[ -n "$cf_ports_raw" ]] && { IFS=',' read -ra cf_ports <<< "$cf_ports_raw"; [[ ${#cf_ports[@]} -eq ${#cf_protos[@]} ]] || die "端口数量不匹配"; }
-            local pi=0
-            for proto in "${cf_protos[@]}"; do
-                local port
-                if [[ ${#cf_ports[@]} -gt 0 ]]; then port="${cf_ports[$pi]// /}"; [[ "$port" =~ ^[0-9]+$ ]] || die "无效端口"; else port=$(rand_port "$existing_ports"); fi
-                existing_ports="$existing_ports $port"
-                local path="${path_prefix}-${PROTO_SUFFIX[$proto]}"
-                routes_json=$(echo "$routes_json" | jq --arg p "$proto" --argjson lp "$((port))" --arg pa "$path" \
-                    '. + [{protocol:$p,mode:"cf",listen_port:$lp,cf_port:$lp,path:$pa}]')
-                pi=$((pi+1))
-            done
-        fi
+    echo ""
+    if [[ "$net_mode" == "nat" ]]; then
+        info "NAT 模式: 逐个协议配置 内网监听端口 和 外网映射端口"
+    else
+        info "直连模式: 逐个协议配置监听端口（内网=外网）"
     fi
+    echo ""
 
-    # 直连类协议
-    if [[ ${#direct_protos[@]} -gt 0 ]]; then
+    for proto in "${protocols[@]}"; do
+        local mode="${PROTO_MODE[$proto]}"
+        local label="${PROTO_LABEL[$proto]}"
+        local listen_port ext_port path=""
+
         if [[ "$net_mode" == "nat" ]]; then
-            for proto in "${direct_protos[@]}"; do
-                local int_port ext_port
-                read -rp "${PROTO_LABEL[$proto]} 内部监听端口: " int_port
-                [[ "$int_port" =~ ^[0-9]+$ ]] || die "无效端口: $int_port"
-                read -rp "${PROTO_LABEL[$proto]} 外部映射端口: " ext_port
-                [[ "$ext_port" =~ ^[0-9]+$ ]] || die "无效端口: $ext_port"
-                routes_json=$(echo "$routes_json" | jq --arg p "$proto" --argjson lp "$((int_port))" --argjson cp "$((ext_port))" \
-                    '. + [{protocol:$p,mode:"direct",listen_port:$lp,cf_port:$cp,path:""}]')
+            # NAT模式: 分别问内网和外网端口
+            while true; do
+                read -rp "  [$label] 内网监听端口(sing-box实际监听): " listen_port
+                [[ "$listen_port" =~ ^[0-9]+$ ]] && break
+                echo "    请输入数字端口"
+            done
+            while true; do
+                read -rp "  [$label] 外网映射端口(路由器/防火墙对外暴露): " ext_port
+                [[ "$ext_port" =~ ^[0-9]+$ ]] && break
+                echo "    请输入数字端口"
             done
         else
-            read -rp "直连类协议端口(逗号分隔，${#direct_protos[@]}个，留空=随机): " direct_ports_raw
-            local direct_ports=()
-            [[ -n "$direct_ports_raw" ]] && { IFS=',' read -ra direct_ports <<< "$direct_ports_raw"; [[ ${#direct_ports[@]} -eq ${#direct_protos[@]} ]] || die "端口数量不匹配"; }
-            local pi=0
-            for proto in "${direct_protos[@]}"; do
-                local port
-                if [[ ${#direct_ports[@]} -gt 0 ]]; then port="${direct_ports[$pi]// /}"; [[ "$port" =~ ^[0-9]+$ ]] || die "无效端口"; else port=$(rand_port "$existing_ports"); fi
-                existing_ports="$existing_ports $port"
-                routes_json=$(echo "$routes_json" | jq --arg p "$proto" --argjson lp "$((port))" \
-                    '. + [{protocol:$p,mode:"direct",listen_port:$lp,cf_port:$lp,path:""}]')
-                pi=$((pi+1))
-            done
+            # 直连模式: 单个端口，回车随机
+            read -rp "  [$label] 监听端口(留空=随机): " listen_port
+            if [[ -z "$listen_port" ]]; then
+                listen_port=$(rand_port "$existing_ports")
+            else
+                [[ "$listen_port" =~ ^[0-9]+$ ]] || die "无效端口: $listen_port"
+            fi
+            ext_port="$listen_port"
         fi
-    fi
+        existing_ports="$existing_ports $listen_port"
+
+        # CF类协议需要WS路径
+        if [[ "$mode" == "cf" ]]; then
+            path="${path_prefix}-${PROTO_SUFFIX[$proto]}"
+        fi
+
+        routes_json=$(echo "$routes_json" | jq \
+            --arg p "$proto" --arg m "$mode" \
+            --argjson lp "$((listen_port))" --argjson cp "$((ext_port))" --arg pa "$path" \
+            '. + [{protocol:$p, mode:$m, listen_port:$lp, cf_port:$cp, path:$pa}]')
+    done
     echo "$routes_json"
 }
 
@@ -630,7 +626,7 @@ do_install() {
             echo "无法匹配 Zone，请确认域名已托管"
         done
     else
-        info "仅直连类协议，无需 Cloudflare"
+        info "仅直连类协议，无需 Cloudflare，直接用公网 IP"
     fi
 
     local uid; uid=$(prompt_uuid)
@@ -648,11 +644,13 @@ do_install() {
 
     local routes_json; routes_json=$(build_routes "$net_mode" "$path_prefix" "${protocols[@]}")
 
-    echo ""; echo "配置预览:"
-    [[ -n "$domain" ]] && echo "  域名:  $domain"
-    echo "  UUID:  $uid"
-    echo "  模式:  $net_mode"
-    echo "$routes_json" | jq -r '.[] | "  \(.protocol) [\(.mode)] 监听:\(.listen_port) 外部:\(.cf_port) 路径:\(.path//"-")"'
+    echo ""; echo "═══ 配置预览 ═══"
+    [[ -n "$domain" ]] && echo "  域名:    $domain"
+    echo "  UUID:    $uid"
+    echo "  模式:    $(net_mode_label "$net_mode")"
+    echo ""
+    echo "$routes_json" | jq -r '.[] | "  [\(.protocol)] 模式:\(.mode)  内网:\(.listen_port)  外网:\(.cf_port)  路径:\(.path//"(无)")"'
+    echo ""
     [[ -n "$reality_public" ]] && echo "  Reality公钥: $reality_public"
     [[ -n "$hysteria2_pass" ]] && echo "  Hysteria2密码: $hysteria2_pass"
     [[ -n "$tuic_pass" ]] && echo "  TUIC密码: $tuic_pass"
@@ -699,10 +697,11 @@ do_install() {
           ssl_backup:$ssl,origin_rules_backup:$orbk,security_backup:$secbk,links:$links,
           reality_private:$rpk,reality_public:$rpub,reality_sid:$rsid,hysteria2_pass:$hpass,tuic_pass:$tpass}')"
 
-    echo ""; ok "部署完成"; print_links "$links_json"
+    echo ""; ok "部署完成"; echo ""
+    print_links "$links_json"
     echo ""; echo "节点链接已保存到 $LAST_LINKS_PATH"
     $need_cf && { echo ""; echo "CF类协议客户端: 地址=$domain 端口=443 TLS=开启 SNI=$domain 网络=WS"; }
-    echo ""; echo "⚠ Hysteria2/TUIC 为 UDP 协议，需确保安全组放行 UDP 端口"
+    echo ""; echo "⚠ Hysteria2/TUIC 为 UDP 协议，需确保安全组/防火墙放行对应 UDP 外网端口"
 }
 
 # ── 2. 卸载 ──────────────────────────────────────────
@@ -740,7 +739,7 @@ do_uninstall() {
     ok "卸载完成"
 }
 
-# ── 3. 查看订阅 ──────────────────────────────────────
+# ── 3. 查看节点链接 ──────────────────────────────────
 do_show() {
     if [[ -f "$LAST_LINKS_PATH" ]]; then cat "$LAST_LINKS_PATH"; return; fi
     local state; state=$(load_state 2>/dev/null || true)
@@ -766,13 +765,13 @@ do_modify() {
     hpass=$(echo "$state" | jq -r '.hysteria2_pass // ""')
     tpass=$(echo "$state" | jq -r '.tuic_pass // ""')
 
-    echo ""; echo "当前配置 ($net_mode):"
+    echo ""; echo "当前配置 ($(net_mode_label "$net_mode")):"
     [[ -n "$domain" ]] && echo "  域名: $domain"
     echo "  UUID: $uid"
-    echo "$routes_json" | jq -r '.[] | "  \(.protocol) [\(.mode)] 监听:\(.listen_port) 外部:\(.cf_port) 路径:\(.path//"-")"'
+    echo "$routes_json" | jq -r '.[] | "  [\(.protocol)] 内网:\(.listen_port) 外网:\(.cf_port) 路径:\(.path//"(无)")"'
     echo ""
     echo "  1. 修改 UUID"
-    echo "  2. 修改端口"
+    echo "  2. 修改端口（逐个协议改内网/外网）"
     echo "  3. 修改 WS 路径(仅CF类)"
     echo "  4. 全部修改"
     echo "  0. 返回"
@@ -794,36 +793,29 @@ do_modify() {
 
     if [[ "$mc" == "2" || "$mc" == "4" ]]; then
         local pc; pc=$(echo "$new_routes" | jq 'length')
-        if [[ "$net_mode" == "nat" ]]; then
-            echo "当前映射: $(echo "$new_routes" | jq -r '[.[] | "\(.listen_port):\(.cf_port)"] | join(",")')"
-            read -rp "新端口映射(内部:外部，共${pc}组，逗号分隔，留空=不改): " mr
-            if [[ -n "$mr" ]]; then
-                IFS=',' read -ra maps <<< "$mr"
-                [[ ${#maps[@]} -eq $pc ]] || die "数量不匹配"
-                local idx=0
-                for m in "${maps[@]}"; do
-                    m="${m// /}"; local lp="${m%%:*}" cp="${m##*:}"
-                    [[ "$lp" =~ ^[0-9]+$ && "$cp" =~ ^[0-9]+$ ]] || die "无效: $m"
-                    new_routes=$(echo "$new_routes" | jq --argjson i $idx --argjson l "$((lp))" --argjson c "$((cp))" '.[$i].listen_port=$l|.[$i].cf_port=$c')
-                    idx=$((idx+1))
-                done
-                changed=true; ok "端口已更新"
+        echo ""
+        info "逐个协议修改端口（留空=不改）"
+        local idx=0
+        for ((idx=0; idx<pc; idx++)); do
+            local proto cur_lp cur_cp label
+            proto=$(echo "$new_routes" | jq -r ".[$idx].protocol")
+            cur_lp=$(echo "$new_routes" | jq -r ".[$idx].listen_port")
+            cur_cp=$(echo "$new_routes" | jq -r ".[$idx].cf_port")
+            label="${PROTO_LABEL[$proto]:-$proto}"
+            if [[ "$net_mode" == "nat" ]]; then
+                read -rp "  [$label] 内网端口(当前=$cur_lp, 留空不改): " nl
+                read -rp "  [$label] 外网端口(当前=$cur_cp, 留空不改): " nc
+                [[ -n "$nl" ]] && { [[ "$nl" =~ ^[0-9]+$ ]] || die "无效端口: $nl"; new_routes=$(echo "$new_routes" | jq --argjson i $idx --argjson v "$((nl))" '.[$i].listen_port=$v'); }
+                [[ -n "$nc" ]] && { [[ "$nc" =~ ^[0-9]+$ ]] || die "无效端口: $nc"; new_routes=$(echo "$new_routes" | jq --argjson i $idx --argjson v "$((nc))" '.[$i].cf_port=$v'); }
+            else
+                read -rp "  [$label] 端口(当前=$cur_lp, 留空不改): " np
+                if [[ -n "$np" ]]; then
+                    [[ "$np" =~ ^[0-9]+$ ]] || die "无效端口: $np"
+                    new_routes=$(echo "$new_routes" | jq --argjson i $idx --argjson v "$((np))" '.[$i].listen_port=$v|.[$i].cf_port=$v')
+                fi
             fi
-        else
-            echo "当前端口: $(echo "$new_routes" | jq -r '[.[].listen_port|tostring] | join(",")')"
-            read -rp "新端口(逗号分隔，共${pc}个，留空=不改): " pr
-            if [[ -n "$pr" ]]; then
-                IFS=',' read -ra nps <<< "$pr"
-                [[ ${#nps[@]} -eq $pc ]] || die "数量不匹配"
-                local idx=0
-                for np in "${nps[@]}"; do
-                    np="${np// /}"; [[ "$np" =~ ^[0-9]+$ ]] || die "无效端口: $np"
-                    new_routes=$(echo "$new_routes" | jq --argjson i $idx --argjson p "$((np))" '.[$i].listen_port=$p|.[$i].cf_port=$p')
-                    idx=$((idx+1))
-                done
-                changed=true; ok "端口已更新"
-            fi
-        fi
+        done
+        changed=true; ok "端口已更新"
     fi
 
     if [[ "$mc" == "3" || "$mc" == "4" ]]; then
@@ -858,10 +850,10 @@ do_show_config() {
     echo ""
     echo "域名/IP: $(echo "$state" | jq -r '.domain // "直连"')"
     echo "UUID:     $(echo "$state" | jq -r '.uuid')"
-    echo "模式:     $(echo "$state" | jq -r '.net_mode // "direct"')"
+    echo "模式:     $(net_mode_label "$(echo "$state" | jq -r '.net_mode // "direct"')")"
     echo ""
     echo "入站:"
-    echo "$state" | jq -r '.routes[] | "  \(.protocol) [\(.mode)] 监听:\(.listen_port) 外部:\(.cf_port) 路径:\(.path//"-")"'
+    echo "$state" | jq -r '.routes[] | "  [\(.protocol)] 模式:\(.mode)  内网:\(.listen_port)  外网:\(.cf_port)  路径:\(.path//"(无)")"'
     local rpub hpass tpass
     rpub=$(echo "$state" | jq -r '.reality_public // ""')
     hpass=$(echo "$state" | jq -r '.hysteria2_pass // ""')
@@ -890,22 +882,23 @@ do_update_ports() {
     zone_id=$(echo "$state" | jq -r '.zone_id // ""')
     uid=$(echo "$state" | jq -r '.uuid')
     echo ""; echo "当前端口映射:"
-    echo "$routes_json" | jq -r '.[] | "  \(.protocol) 监听:\(.listen_port) -> 外部:\(.cf_port)"'
+    echo "$routes_json" | jq -r '.[] | "  [\(.protocol)] 内网:\(.listen_port) -> 外网:\(.cf_port)"'
     [[ "$net_mode" != "nat" ]] && { info "直连模式请使用 [4.修改配置]"; return; }
     local pc; pc=$(echo "$routes_json" | jq 'length')
-    info "NAT 模式: 更新外部端口(CF Origin Rules + 直连协议)"
-    local new_routes="$routes_json" idx=0 rows=() row
-    mapfile -t rows < <(echo "$routes_json" | jq -r '.[] | [.protocol, (.cf_port|tostring)] | @tsv')
-    for row in "${rows[@]}"; do
-        local proto="${row%%$'\t'*}" old_cp="${row##*$'\t'}" ne
-        read -rp "${proto} 新外部端口(当前=${old_cp}): " ne
-        [[ -n "$ne" ]] || die "不能为空"
+    info "NAT 模式: 逐个更新外网端口"
+    local new_routes="$routes_json" idx=0
+    for ((idx=0; idx<pc; idx++)); do
+        local proto old_cp label ne
+        proto=$(echo "$new_routes" | jq -r ".[$idx].protocol")
+        old_cp=$(echo "$new_routes" | jq -r ".[$idx].cf_port")
+        label="${PROTO_LABEL[$proto]:-$proto}"
+        read -rp "  [$label] 新外网端口(当前=$old_cp, 留空不改): " ne
+        [[ -z "$ne" ]] && continue
         [[ "$ne" =~ ^[0-9]+$ ]] || die "无效端口: $ne"
         new_routes=$(echo "$new_routes" | jq --argjson i $idx --argjson p "$((ne))" '.[$i].cf_port=$p')
-        idx=$((idx+1))
     done
     echo ""; echo "更新预览:"
-    echo "$new_routes" | jq -r '.[] | "  \(.protocol) 监听:\(.listen_port) -> 外部:\(.cf_port)"'
+    echo "$new_routes" | jq -r '.[] | "  [\(.protocol)] 内网:\(.listen_port) -> 外网:\(.cf_port)"'
     read -rp "确认? (Y/n): " confirm
     [[ "${confirm,,}" =~ ^(|y|yes)$ ]] || die "已取消"
     if has_cf_proto "$new_routes" && load_cf_account && [[ -n "$zone_id" ]]; then
@@ -939,7 +932,7 @@ do_switch_net_mode() {
     cur=$(echo "$state" | jq -r '.net_mode // "direct"')
     routes_json=$(echo "$state" | jq '.routes')
     echo ""; echo "当前模式: $(net_mode_label "$cur")"
-    echo "$routes_json" | jq -r '.[] | "  \(.protocol) 监听:\(.listen_port) 外部:\(.cf_port)"'
+    echo "$routes_json" | jq -r '.[] | "  [\(.protocol)] 内网:\(.listen_port) 外网:\(.cf_port)"'
     local target; [[ "$cur" == "nat" ]] && target="direct" || target="nat"
     read -rp "确认切换到 $(net_mode_label "$target")? (y/N): " c
     [[ "${c,,}" =~ ^(y|yes)$ ]] || die "已取消"
@@ -947,19 +940,22 @@ do_switch_net_mode() {
     if [[ "$target" == "direct" ]]; then
         new_routes=$(echo "$new_routes" | jq '[.[] | .cf_port = .listen_port]')
     else
-        local idx=0 rows=() row
-        mapfile -t rows < <(echo "$routes_json" | jq -r '.[] | [.protocol, (.listen_port|tostring)] | @tsv')
-        for row in "${rows[@]}"; do
-            local proto="${row%%$'\t'*}" lp="${row##*$'\t'}" ep
-            read -rp "${proto} 对外端口(监听=${lp}, 回车=相同): " ep
+        local pc idx
+        pc=$(echo "$new_routes" | jq 'length')
+        info "逐个协议设置外网映射端口"
+        for ((idx=0; idx<pc; idx++)); do
+            local proto lp label ep
+            proto=$(echo "$new_routes" | jq -r ".[$idx].protocol")
+            lp=$(echo "$new_routes" | jq -r ".[$idx].listen_port")
+            label="${PROTO_LABEL[$proto]:-$proto}"
+            read -rp "  [$label] 外网端口(内网=$lp, 回车=相同): " ep
             [[ -n "$ep" ]] || ep="$lp"
             [[ "$ep" =~ ^[0-9]+$ ]] || die "无效端口: $ep"
             new_routes=$(echo "$new_routes" | jq --argjson i $idx --argjson p "$((ep))" '.[$i].cf_port=$p')
-            idx=$((idx+1))
         done
     fi
     echo ""; echo "更新预览:"
-    echo "$new_routes" | jq -r '.[] | "  \(.protocol) 监听:\(.listen_port) 外部:\(.cf_port)"'
+    echo "$new_routes" | jq -r '.[] | "  [\(.protocol)] 内网:\(.listen_port) 外网:\(.cf_port)"'
     read -rp "确认? (Y/n): " confirm
     [[ "${confirm,,}" =~ ^(|y|yes)$ ]] || die "已取消"
     if has_cf_proto "$new_routes" && load_cf_account && [[ -n "$zone_id" ]]; then
