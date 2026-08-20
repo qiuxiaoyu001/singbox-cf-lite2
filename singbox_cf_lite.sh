@@ -1,1086 +1,541 @@
-#!/usr/bin/env bash
-set -euo pipefail
-# ═══════════════════════════════════════════════════════════
-#  sing-box-cf-lite  —  三协议 Cloudflare 一键脚本
-#  协议: VLESS+WS | VMess+WS | Trojan+WS  (CF flexible 边缘 TLS)
-#  内核: sing-box 精简版 (UPX) ·小鸡可跑
-#  代码透明 · 二进制仅从官方/指定源下载
-# ═══════════════════════════════════════════════════════════
+#!/bin/sh
+# sing-box 6协议一键脚本 (Alpine/OpenRC) - Cloudflare 增强版
+# 协议: VLESS+WS | VMess+WS | Trojan+WS (支持CF CDN) | VLESS-Reality | Hysteria2 | TUIC v5
 
-# ── 常量 ──────────────────────────────────────────────
-SINGBOX_CONF_DIR="/etc/sing-box/conf"
-SINGBOX_BINARY="/usr/local/bin/sing-box"
-SINGBOX_WORK_DIR="/etc/sing-box"
-STATE_DIR="/etc/singbox-cf-lite"
-STATE_PATH="$STATE_DIR/state.json"
-CF_ACCOUNT_PATH="$STATE_DIR/cf_account.json"
-LAST_LINKS_PATH="$(pwd)/sb_cf_lite_last_links.txt"
+# ── 颜色与全局变量 ──
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+PLAIN='\033[0m'
+
+CONF_DIR="/etc/sing-box"
+CONF="${CONF_DIR}/config.json"
+SERVICE_NAME="sing-box"
+LAST_LINK_FILE="${CONF_DIR}/last_link.txt"
+CF_ACCOUNT_PATH="${CONF_DIR}/cf_account.json"
+CERT_FILE="${CONF_DIR}/cert.pem"
+KEY_FILE="${CONF_DIR}/key.pem"
 CF_API="https://api.cloudflare.com/client/v4"
 MANAGED_PREFIX="sb-cf-lite "
-# 精简版二进制地址（UPX 压缩，~5MB）；留空则从官方下载完整版
-# 自己编译: CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" ./cmd/sing-box && upx --best --lzma sing-box
-SINGBOX_MINI_URL="${SINGBOX_MINI_URL:-}"
-SINGBOX_OFFICIAL_API="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
 
-declare -A PROTO_SUFFIX=([vless]="vl" [trojan]="tr" [vmess]="vm")
-declare -A PROTO_LABEL=([vless]="VLESS" [trojan]="TROJAN" [vmess]="VMESS")
+if [ "$(id -u)" != "0" ]; then
+  echo -e "${RED}✗ 请使用 root 用户运行此脚本！${PLAIN}"
+  exit 1
+fi
 
-# ── 工具 ──────────────────────────────────────────────
-die()     { printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
-ok()      { printf '\033[32m✓\033[0m %s\n' "$*" >&2; }
-info()    { printf '\033[36m·\033[0m %s\n' "$*" >&2; }
-need_cmd(){ command -v "$1" &>/dev/null || die "缺少依赖: $1"; }
+# ── 基础工具函数 ──
+gen_uuid() {
+  cat /proc/sys/kernel/random/uuid 2>/dev/null || head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n'
+}
+
+gen_rand_pass() {
+  head -c 16 /dev/urandom | base64 | tr -d '/+=\n'
+}
+
+gen_shortid() {
+  head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n'
+}
+
 urlencode() {
-    local s="$1" c
-    local -i i
-    for ((i=0; i<${#s}; i++)); do
-        c="${s:i:1}"
-        case "$c" in
-            [a-zA-Z0-9.~_-]) printf '%s' "$c" ;;
-            *) printf '%%%02X' "'$c" ;;
-        esac
-    done
-}
-gen_uuid() { cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen | tr '[:upper:]' '[:lower:]'; }
-
-# ── 内存检测（64M 小鸡优化）──────────────────────────
-get_mem_mb() {
-    local mem
-    mem=$(free -m 2>/dev/null | awk '/Mem:/{print $2}')
-    [[ -z "$mem" || "$mem" == "0" ]] && mem=999
-    echo "$mem"
-}
-ensure_swap() {
-    # 64M 小鸡必加 swap，否则 sing-box 启动时可能 OOM
-    local mem
-    mem=$(get_mem_mb)
-    [[ "$mem" -ge 128 ]] && return 0
-    if ! swapon --show 2>/dev/null | grep -q .; then
-        info "低内存 (${mem}MB) 检测到无 swap，自动创建 128M swap..."
-        fallocate -l 128M /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=128 2>/dev/null || true
-        if [[ -f /swapfile ]]; then
-            chmod 600 /swapfile
-            mkswap /swapfile >/dev/null 2>&1
-            swapon /swapfile 2>/dev/null && ok "swap 已启用 (128M)" || warn "swap 启用失败，请手动配置"
-            grep -q '/swapfile' /etc/fstab 2>/dev/null || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-        fi
-    fi
-}
-
-# ── init 系统检测 ─────────────────────────────────────
-INIT_SYSTEM=""
-detect_init() {
-    if command -v systemctl &>/dev/null && systemctl --version &>/dev/null 2>&1; then
-        INIT_SYSTEM="systemd"
-    elif command -v rc-service &>/dev/null; then
-        INIT_SYSTEM="openrc"
-    else
-        die "不支持的 init 系统（需要 systemd 或 OpenRC）"
-    fi
-}
-
-# ── 包管理器 ──────────────────────────────────────────
-install_deps() {
-    local missing=()
-    command -v curl  &>/dev/null || missing+=(curl)
-    command -v jq    &>/dev/null || missing+=(jq)
-    [[ ${#missing[@]} -eq 0 ]] && return
-    echo "安装依赖: ${missing[*]}"
-    if command -v apk &>/dev/null; then
-        apk add --no-cache "${missing[@]}"
-    elif command -v apt-get &>/dev/null; then
-        apt-get update -qq && apt-get install -y -qq "${missing[@]}"
-    elif command -v yum &>/dev/null; then
-        yum install -y "${missing[@]}"
-    else
-        die "无法安装依赖 ${missing[*]}，请手动安装"
-    fi
-}
-
-# ── sing-box 服务管理 ─────────────────────────────────
-SINGBOX_OPENRC_SCRIPT="/etc/init.d/sing-box"
-write_openrc_script() {
-    cat > "$SINGBOX_OPENRC_SCRIPT" << 'INITEOF'
-#!/sbin/openrc-run
-name="sing-box"
-description="sing-box proxy server (cf-lite)"
-command="/usr/local/bin/sing-box"
-command_args="run -C /etc/sing-box/conf"
-command_background=true
-pidfile="/run/sing-box.pid"
-output_log="/var/log/sing-box.log"
-error_log="/var/log/sing-box.log"
-respawn_delay=1
-respawn_max=0
-respawn_period=86400
-supervise_daemon_args="--respawn-delay ${respawn_delay} --respawn-max ${respawn_max} --respawn-period ${respawn_period}"
-supervisor=supervise-daemon
-depend() { need net; after firewall; }
-INITEOF
-    chmod +x "$SINGBOX_OPENRC_SCRIPT"
-}
-write_systemd_service() {
-    local mem_limit=""
-    local total_mem
-    total_mem=$(get_mem_mb)
-    # 64M 小鸡限制内存，防止 OOM 拖垮系统
-    if [[ "$total_mem" -lt 128 ]]; then
-        mem_limit="MemoryMax=56M
-MemoryHigh=48M"
-    fi
-    cat > /etc/systemd/system/sing-box.service << EOF
-[Unit]
-Description=sing-box service (cf-lite)
-Documentation=https://sing-box.sagernet.org
-After=network.target nss-lookup.target
-
-[Service]
-User=root
-WorkingDirectory=${SINGBOX_WORK_DIR}
-ExecStart=${SINGBOX_BINARY} run -C ${SINGBOX_CONF_DIR}
-ExecReload=/bin/kill -HUP \$MAINPID
-Restart=on-failure
-RestartSec=1
-LimitNOFILE=infinity
-${mem_limit}
-
-[Install]
-WantedBy=multi-user.target
-EOF
-}
-svc_enable()    { if [[ "$INIT_SYSTEM" == "systemd" ]]; then systemctl enable sing-box &>/dev/null; else rc-update add sing-box default &>/dev/null; fi; true; }
-svc_start()     { if [[ "$INIT_SYSTEM" == "systemd" ]]; then systemctl restart sing-box; else [[ -f "$SINGBOX_OPENRC_SCRIPT" ]] || write_openrc_script; rc-service sing-box restart; fi; }
-svc_stop()      { if [[ "$INIT_SYSTEM" == "systemd" ]]; then systemctl stop sing-box &>/dev/null; systemctl disable sing-box &>/dev/null; else rc-service sing-box stop &>/dev/null; rc-update del sing-box default &>/dev/null; fi; true; }
-svc_is_active() { if [[ "$INIT_SYSTEM" == "systemd" ]]; then systemctl is-active sing-box &>/dev/null; else rc-service sing-box status &>/dev/null 2>&1; fi; }
-restart_singbox() {
-    [[ "$INIT_SYSTEM" == "systemd" ]] && write_systemd_service && systemctl daemon-reload
-    svc_enable
-    svc_start || die "sing-box 重启失败"
-    sleep 1
-    svc_is_active || die "sing-box 未正常启动，请查看日志: journalctl -u sing-box"
-    ok "sing-box 服务已启动"
-}
-stop_singbox() { svc_stop; }
-
-# ── 网络检测 ─────────────────────────────────────────
-get_public_ip() {
-    local ip
-    for url in https://api.ipify.org https://ipv4.icanhazip.com https://ifconfig.me/ip; do
-        ip=$(curl -sf --max-time 8 "$url" 2>/dev/null) && [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && echo "$ip" && return
-    done
-    die "获取公网 IPv4 失败"
-}
-detect_nat() {
-    local public_ip
-    public_ip=$(get_public_ip)
-    if ip addr show 2>/dev/null | grep -qE "inet ${public_ip}/"; then
-        echo "direct"
-        return
-    fi
-    echo "nat"
-}
-net_mode_label() {
-    [[ "$1" == "direct" ]] && echo "直连（公网端口直达本机）" || echo "NAT（需要端口映射）"
-}
-prompt_net_mode() {
-    local detected="$1" ans
-    echo >&2
-    info "网络环境探测结果: $(net_mode_label "$detected")" >&2
-    if [[ "$detected" == "nat" ]]; then
-        echo "  如果这台机器有独立公网 IP、外部能直接连到你要开的端口（常见于云厂商的一对一 NAT）," >&2
-        echo "  这里就该选直连，否则会让你填一堆并不存在的端口映射。" >&2
-    else
-        echo "  如果这台机器其实在 NAT/软路由后面，对外端口和本机监听端口不一致，这里要选 NAT。" >&2
-    fi
-    read -rp "使用哪种模式? (1=直连, 2=NAT, 回车=用探测结果): " ans
-    case "$ans" in
-        1) echo "direct" ;;
-        2) echo "nat" ;;
-        "") echo "$detected" ;;
-        *) die "无效选项: $ans" ;;
+  local s="$1" c i
+  i=0
+  while [ $i -lt ${#s} ]; do
+    c=$(echo "$s" | cut -c $((i+1)))
+    case "$c" in
+      [a-zA-Z0-9.~_-]) printf '%s' "$c" ;;
+      *) printf '%%%02X' "$(printf '%s' "$c" | od -An -tu1)" ;;
     esac
-}
-get_listening_ports() {
-    ss -tlnH 2>/dev/null | awk '{print $4}' | grep -oE '[0-9]+$' | sort -un | tr '\n' ' '
-}
-rand_port() {
-    local existing="$1" p
-    while true; do
-        p=$(( RANDOM % 50000 + 10000 ))
-        echo "$existing" | grep -qw "$p" || { echo "$p"; return; }
-    done
+    i=$((i+1))
+  done
 }
 
-# ── CF API ────────────────────────────────────────────
-cf_call() {
-    local method="$1" endpoint="$2" data="${3:-}"
-    local args=(-s -f -X "$method" -H "X-Auth-Email: $CF_EMAIL" -H "X-Auth-Key: $CF_KEY" -H "Content-Type: application/json")
-    [[ -n "$data" ]] && args+=(-d "$data")
-    curl "${args[@]}" "${CF_API}${endpoint}"
-}
-cf_call_raw() {
-    local method="$1" endpoint="$2" data="${3:-}"
-    local args=(-s -X "$method" -H "X-Auth-Email: $CF_EMAIL" -H "X-Auth-Key: $CF_KEY" -H "Content-Type: application/json")
-    [[ -n "$data" ]] && args+=(-d "$data")
-    curl "${args[@]}" "${CF_API}${endpoint}"
+get_external_ip() {
+  curl -s --max-time 3 ifconfig.me 2>/dev/null \
+    || curl -s --max-time 3 icanhazip.com 2>/dev/null \
+    || echo "127.0.0.1"
 }
 
-# ── CF 凭据 ───────────────────────────────────────────
+# ── 依赖安装 ──
+install_dep() {
+  local pkgs=""
+  command -v jq >/dev/null 2>&1 || pkgs="$pkgs jq"
+  command -v curl >/dev/null 2>&1 || pkgs="$pkgs curl"
+  if [ -n "$pkgs" ]; then
+    echo -e "${YELLOW}· 正在安装依赖: $pkgs ...${PLAIN}"
+    apk update >/dev/null 2>&1
+    # shellcheck disable=SC2086
+    apk add $pkgs >/dev/null 2>&1
+  fi
+}
+
+# ── 下载内核 ──
+download_singbox() {
+  mkdir -p "$CONF_DIR"
+  if [ -n "${SINGBOX_MINI_URL:-}" ]; then
+    echo -e "${YELLOW}· 下载自定义精简内核...${PLAIN}"
+    curl -L -o /usr/bin/sing-box "$SINGBOX_MINI_URL"
+  else
+    echo -e "${YELLOW}· 未设置 SINGBOX_MINI_URL，尝试获取官方最新版...${PLAIN}"
+    local arch
+    case "$(uname -m)" in
+      x86_64) arch="amd64" ;;
+      aarch64) arch="arm64" ;;
+      *) echo -e "${RED}✗ 不支持的架构: $(uname -m)${PLAIN}"; exit 1 ;;
+    esac
+    
+    local version url tmp_dir
+    version=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | jq -r '.tag_name' | sed 's/v//')
+    [ -z "$version" ] || [ "$version" = "null" ] && version="1.9.3"
+    url="https://github.com/SagerNet/sing-box/releases/download/v${version}/sing-box-${version}-linux-${arch}.tar.gz"
+    
+    tmp_dir="/tmp/sb_dl"
+    mkdir -p "$tmp_dir"
+    curl -L -o "$tmp_dir/sb.tar.gz" "$url"
+    tar -xzf "$tmp_dir/sb.tar.gz" -C "$tmp_dir"
+    mv "$tmp_dir/sing-box-${version}-linux-${arch}/sing-box" /usr/bin/sing-box
+    rm -rf "$tmp_dir"
+  fi
+
+  chmod +x /usr/bin/sing-box
+  if ! /usr/bin/sing-box version >/dev/null 2>&1; then
+    echo -e "${RED}✗ 内核二进制不可用！${PLAIN}"
+    exit 1
+  fi
+  echo -e "${GREEN}· 内核安装完成: $(/usr/bin/sing-box version | head -1)${PLAIN}"
+}
+
+# ── OpenRC 服务 ──
+write_service_openrc() {
+  cat > /etc/init.d/${SERVICE_NAME} <<EOF
+#!/sbin/openrc-run
+description="sing-box service"
+command="/usr/bin/sing-box"
+command_args="run -c ${CONF}"
+command_background="yes"
+pidfile="/run/${SERVICE_NAME}.pid"
+output_log="/var/log/${SERVICE_NAME}.log"
+error_log="/var/log/${SERVICE_NAME}.log"
+depend() {
+  need net
+}
+EOF
+  chmod +x /etc/init.d/${SERVICE_NAME}
+  rc-update add ${SERVICE_NAME} default >/dev/null 2>&1
+  echo -e "${GREEN}· OpenRC 服务已创建${PLAIN}"
+}
+
+# ── Cloudflare API 封装 ──
 CF_EMAIL="" CF_KEY=""
 load_cf_account() {
-    [[ -f "$CF_ACCOUNT_PATH" ]] || return 1
-    CF_EMAIL=$(jq -r '.email // ""' "$CF_ACCOUNT_PATH")
-    CF_KEY=$(jq -r '.api_key // ""' "$CF_ACCOUNT_PATH")
-    [[ -n "$CF_EMAIL" && -n "$CF_KEY" ]]
+  [ -f "$CF_ACCOUNT_PATH" ] || return 1
+  CF_EMAIL=$(jq -r '.email // ""' "$CF_ACCOUNT_PATH")
+  CF_KEY=$(jq -r '.api_key // ""' "$CF_ACCOUNT_PATH")
+  [ -n "$CF_EMAIL" ] && [ -n "$CF_KEY" ]
 }
 save_cf_account() {
-    mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"
-    jq -n --arg e "$CF_EMAIL" --arg k "$CF_KEY" '{email:$e,api_key:$k}' > "$CF_ACCOUNT_PATH"
-    chmod 600 "$CF_ACCOUNT_PATH"
+  mkdir -p "$CONF_DIR"
+  jq -n --arg e "$CF_EMAIL" --arg k "$CF_KEY" '{email:$e,api_key:$k}' > "$CF_ACCOUNT_PATH"
+  chmod 600 "$CF_ACCOUNT_PATH"
+}
+cf_call() {
+  local method="$1" endpoint="$2" data="${3:-}"
+  local args=(-s -f -X "$method" -H "X-Auth-Email: $CF_EMAIL" -H "X-Auth-Key: $CF_KEY" -H "Content-Type: application/json")
+  [ -n "$data" ] && args+=("$data") # 修复传参
+  curl "${args[@]}" "${CF_API}${endpoint}"
+}
+cf_call_raw() {
+  local method="$1" endpoint="$2" data="${3:-}"
+  local args=(-s -X "$method" -H "X-Auth-Email: $CF_EMAIL" -H "X-Auth-Key: $CF_KEY" -H "Content-Type: application/json")
+  [ -n "$data" ] && args+=("-d" "$data")
+  curl "${args[@]}" "${CF_API}${endpoint}"
 }
 cf_verify_credentials() {
-    local r
-    r=$(curl -s -X GET "${CF_API}/user/tokens/verify" \
-        -H "X-Auth-Email: $CF_EMAIL" -H "X-Auth-Key: $CF_KEY" -H "Content-Type: application/json")
-    if echo "$r" | jq -e '.success == true' &>/dev/null; then
-        return 0
-    fi
-    r=$(curl -s -X GET "${CF_API}/zones?per_page=1" \
-        -H "X-Auth-Email: $CF_EMAIL" -H "X-Auth-Key: $CF_KEY" -H "Content-Type: application/json")
-    echo "$r" | jq -e '.success == true' &>/dev/null
+  local r
+  r=$(curl -s -X GET "${CF_API}/user/tokens/verify" -H "X-Auth-Email: $CF_EMAIL" -H "X-Auth-Key: $CF_KEY" -H "Content-Type: application/json")
+  echo "$r" | jq -e '.success == true' >/dev/null 2>&1 && return 0
+  r=$(curl -s -X GET "${CF_API}/zones?per_page=1" -H "X-Auth-Email: $CF_EMAIL" -H "X-Auth-Key: $CF_KEY" -H "Content-Type: application/json")
+  echo "$r" | jq -e '.success == true' >/dev/null 2>&1
 }
 prompt_cf() {
-    if load_cf_account; then
-        local masked="${CF_KEY:0:6}...${CF_KEY: -4}"
-        read -rp "复用已保存 CF 凭据 ($CF_EMAIL, Key=$masked)? (Y/n): " ans
-        if [[ "${ans,,}" =~ ^(|y|yes)$ ]]; then
-            if cf_verify_credentials; then
-                return 0
-            fi
-            echo "已保存的 CF 凭据校验失败，请重新输入"
-        fi
+  if load_cf_account; then
+    printf "检测到已保存的 CF 账号 (%s)，是否复用？(Y/n): " "$CF_EMAIL"
+    read ans
+    case "$ans" in
+      [nN]*) ;;
+      *) cf_verify_credentials && return 0; echo "凭据失效，需重新输入" ;;
+    esac
+  fi
+  while true; do
+    printf "Cloudflare 邮箱: "
+    read CF_EMAIL
+    printf "Cloudflare Global API Key: "
+    read -r CF_KEY
+    if [ -z "$CF_EMAIL" ] || [ -z "$CF_KEY" ]; then
+      echo "邮箱和 Key 不能为空"
+      continue
     fi
-    while true; do
-        read -rp "Cloudflare 邮箱: " CF_EMAIL || die "输入已中断"
-        read -rsp "Cloudflare Global API Key: " CF_KEY || die "输入已中断"; echo
-        if [[ -z "$CF_EMAIL" || -z "$CF_KEY" ]]; then
-            echo "邮箱和 API Key 不能为空，请重试"
-            continue
-        fi
-        echo -n "校验凭据... "
-        if cf_verify_credentials; then
-            echo "通过"
-            save_cf_account
-            return 0
-        fi
-        echo "失败：邮箱或 API Key 错误，请重新输入（Ctrl+C 退出）"
-    done
+    printf "正在校验凭据... "
+    if cf_verify_credentials; then
+      echo -e "${GREEN}通过${PLAIN}"
+      save_cf_account
+      return 0
+    else
+      echo -e "${RED}失败，请检查后重试${PLAIN}"
+    fi
+  done
 }
-
-# ── CF DNS / SSL / Origin Rules ───────────────────────
 cf_find_zone() {
-    local domain="$1" zones best_name="" best_id=""
-    zones=$(cf_call GET "/zones?per_page=100" | jq -r '.result[] | "\(.name) \(.id)"')
-    while IFS=' ' read -r zone_name zone_id; do
-        if [[ "$domain" == "$zone_name" || "$domain" == *".$zone_name" ]]; then
-            [[ ${#zone_name} -gt ${#best_name} ]] && best_name="$zone_name" && best_id="$zone_id"
-        fi
-    done <<< "$zones"
-    [[ -n "$best_id" ]] || return 1
-    echo "$best_id"
+  local domain="$1" zones zone_name zone_id best_name="" best_id=""
+  zones=$(cf_call GET "/zones?per_page=100" | jq -r '.result[]? | "\(.name) \(.id)"')
+  while read -r zone_name zone_id; do
+    [ -z "$zone_name" ] && continue
+    if [ "$domain" = "$zone_name" ] || [ "${domain#*.$zone_name}" != "$domain" ]; then
+      [ ${#zone_name} -gt ${#best_name} ] && best_name="$zone_name" && best_id="$zone_id"
+    fi
+  done <<EOF
+$zones
+EOF
+  [ -n "$best_id" ] || return 1
+  echo "$best_id"
 }
 cf_get_dns() {
-    cf_call GET "/zones/$1/dns_records?type=A&name=$2" | jq '.result[0] // empty'
+  cf_call GET "/zones/$1/dns_records?type=A&name=$2" | jq '.result[0] // empty'
 }
 cf_upsert_dns() {
-    local zone_id="$1" domain="$2" ip="$3"
-    local payload existing
-    payload=$(jq -n --arg n "$domain" --arg c "$ip" '{type:"A",name:$n,content:$c,proxied:true,ttl:1}')
-    existing=$(cf_get_dns "$zone_id" "$domain")
-    if [[ -n "$existing" ]]; then
-        local rid; rid=$(echo "$existing" | jq -r '.id')
-        cf_call PUT "/zones/${zone_id}/dns_records/${rid}" "$payload" | jq -r '.result.id'
-    else
-        cf_call POST "/zones/${zone_id}/dns_records" "$payload" | jq -r '.result.id'
-    fi
+  local zone_id="$1" domain="$2" ip="$3"
+  local payload existing rid
+  payload=$(jq -n --arg n "$domain" --arg c "$ip" '{type:"A",name:$n,content:$c,proxied:true,ttl:1}')
+  existing=$(cf_get_dns "$zone_id" "$domain")
+  if [ -n "$existing" ] && [ "$existing" != "null" ]; then
+    rid=$(echo "$existing" | jq -r '.id')
+    cf_call PUT "/zones/${zone_id}/dns_records/${rid}" "$payload" | jq -r '.result.id'
+  else
+    cf_call POST "/zones/${zone_id}/dns_records" "$payload" | jq -r '.result.id'
+  fi
 }
-cf_get_ssl()  { cf_call GET "/zones/$1/settings/ssl" | jq -r '.result.value'; }
-cf_set_ssl()  { cf_call PATCH "/zones/$1/settings/ssl" "$(jq -n --arg v "$2" '{value:$v}')" >/dev/null; }
-
-# ── CF 安全规则 ───────────────────────────────────────
-cf_get_security_level() { cf_call GET "/zones/$1/settings/security_level" | jq -r '.result.value'; }
-cf_set_security_level() { cf_call PATCH "/zones/$1/settings/security_level" "$(jq -n --arg v "$2" '{value:$v}')" >/dev/null; }
-cf_get_browser_check() { cf_call GET "/zones/$1/settings/browser_check" | jq -r '.result.value'; }
-cf_set_browser_check() { cf_call PATCH "/zones/$1/settings/browser_check" "$(jq -n --arg v "$2" '{value:$v}')" >/dev/null; }
-cf_get_bot_management() { cf_call_raw GET "/zones/$1/bot_management" | jq '.result // {}'; }
-cf_set_bot_fight_off() {
-    local zone_id="$1"
-    cf_call_raw PUT "/zones/${zone_id}/bot_management" "$(jq -n '{
-        enable_js: false,
-        sbfm_likely_automated: "allow",
-        sbfm_definitely_automated: "allow",
-        sbfm_verified_bots: "allow",
-        sbfm_static_resource_protection: false
-    }')" | jq -e '.success' &>/dev/null
-}
-cf_restore_bot_management() {
-    local zone_id="$1" backup="$2"
-    local payload
-    payload=$(echo "$backup" | jq '{
-        enable_js: .enable_js,
-        sbfm_likely_automated: .sbfm_likely_automated,
-        sbfm_definitely_automated: .sbfm_definitely_automated,
-        sbfm_verified_bots: .sbfm_verified_bots,
-        sbfm_static_resource_protection: .sbfm_static_resource_protection
-    }')
-    cf_call_raw PUT "/zones/${zone_id}/bot_management" "$payload" | jq -e '.success' &>/dev/null
-}
-cf_relax_security() {
-    local zone_id="$1"
-    local sec_level bot_mgmt browser_check
-    sec_level=$(cf_get_security_level "$zone_id")
-    browser_check=$(cf_get_browser_check "$zone_id")
-    bot_mgmt=$(cf_get_bot_management "$zone_id")
-    if [[ "$sec_level" != "essentially_off" ]]; then
-        cf_set_security_level "$zone_id" "essentially_off"
-        ok "Security Level: essentially_off"
-    fi
-    if [[ "$browser_check" != "off" ]]; then
-        cf_set_browser_check "$zone_id" "off"
-        ok "Browser Check: off"
-    fi
-    local sbfm_likely
-    sbfm_likely=$(echo "$bot_mgmt" | jq -r '.sbfm_likely_automated // ""')
-    if [[ "$sbfm_likely" != "allow" ]]; then
-        cf_set_bot_fight_off "$zone_id"
-        ok "Bot Fight Mode: 已关闭"
-    fi
-    jq -n --arg sl "$sec_level" --arg bc "$browser_check" --argjson bm "$bot_mgmt" \
-        '{security_level:$sl, browser_check:$bc, bot_management:$bm}'
-}
-cf_restore_security() {
-    local zone_id="$1" backup="$2"
-    [[ -z "$backup" || "$backup" == "null" ]] && return
-    local sl bc bm
-    sl=$(echo "$backup" | jq -r '.security_level // ""')
-    bc=$(echo "$backup" | jq -r '.browser_check // ""')
-    bm=$(echo "$backup" | jq '.bot_management // null')
-    [[ -n "$sl" ]] && cf_set_security_level "$zone_id" "$sl" && ok "Security Level 已恢复: $sl"
-    [[ -n "$bc" ]] && cf_set_browser_check "$zone_id" "$bc" && ok "Browser Check 已恢复: $bc"
-    [[ "$bm" != "null" ]] && cf_restore_bot_management "$zone_id" "$bm" && ok "Bot Fight Mode 已恢复"
-}
+cf_set_ssl() { cf_call PATCH "/zones/$1/settings/ssl" "$(jq -n --arg v "$2" '{value:$v}')" >/dev/null; }
 cf_get_origin_rules() {
-    local r; r=$(cf_call_raw GET "/zones/$1/rulesets/phases/http_request_origin/entrypoint")
-    echo "$r" | jq -r 'if .success then .result.rules // [] else [] end' 2>/dev/null || echo '[]'
+  cf_call_raw GET "/zones/$1/rulesets/phases/http_request_origin/entrypoint" | jq -r '.result.rules // []'
 }
 cf_put_origin_rules() {
-    local r; r=$(cf_call_raw PUT "/zones/$1/rulesets/phases/http_request_origin/entrypoint" \
-        "$(jq -n --argjson r "$2" '{rules:$r}')")
-    echo "$r" | jq -e '.success' &>/dev/null || die "Origin Rules 写入失败: $(echo "$r" | jq -c '.errors')"
-}
-build_new_origin_rules() {
-    local domain="$1" routes_json="$2"
-    echo "$routes_json" | jq --arg d "$domain" --arg pfx "$MANAGED_PREFIX" '[
-        .[] | {
-            description: ($pfx + .protocol + " " + .path),
-            enabled: true,
-            expression: ("(http.host eq \"" + $d + "\" and http.request.uri.path eq \"" + .path + "\")"),
-            action: "route",
-            action_parameters: { origin: { port: .cf_port } }
-        }
-    ]'
+  cf_call_raw PUT "/zones/$1/rulesets/phases/http_request_origin/entrypoint" "$(jq -n --argjson r "$2" '{rules:$r}')" >/dev/null
 }
 apply_origin_rules() {
-    local zone_id="$1" domain="$2" routes_json="$3"
-    local existing kept new_managed merged
-    existing=$(cf_get_origin_rules "$zone_id")
-    kept=$(echo "$existing" | jq --arg d "$domain" --arg pfx "$MANAGED_PREFIX" '[
-        .[] | select(
-            (.description | startswith($pfx) | not) or
-            (.expression | ascii_downcase | contains("http.host eq \"" + ($d|ascii_downcase) + "\"") | not)
-        )
-    ]')
-    new_managed=$(build_new_origin_rules "$domain" "$routes_json")
-    merged=$(jq -n --argjson a "$kept" --argjson b "$new_managed" '$a + $b')
-    cf_put_origin_rules "$zone_id" "$merged"
+  local zone_id="$1" domain="$2" proto="$3" port="$4" path="$5"
+  local existing kept new_rule merged
+  existing=$(cf_get_origin_rules "$zone_id")
+  kept=$(echo "$existing" | jq --arg d "$domain" --arg pfx "$MANAGED_PREFIX" '[.[] | select((.description | startswith($pfx) | not))]')
+  new_rule=$(jq -n --arg d "$domain" --arg pfx "$MANAGED_PREFIX" --arg proto "$proto" --arg path "$path" --argjson port "$port" '[{
+    description: ($pfx + $proto),
+    enabled: true,
+    expression: ("(http.host eq \"" + $d + "\" and http.request.uri.path eq \"" + $path + "\")"),
+    action: "route",
+    action_parameters: { origin: { port: $port } }
+  }]')
+  merged=$(jq -n --argjson a "$kept" --argjson b "$new_rule" '$a + $b')
+  cf_put_origin_rules "$zone_id" "$merged"
 }
 
-# ── sing-box 安装（精简二进制）────────────────────────
-get_singbox_arch() {
-    case "$(uname -m)" in
-        x86_64|amd64) echo "amd64" ;;
-        aarch64|arm64) echo "arm64" ;;
-        armv7l) echo "armv7" ;;
-        i386|i686) echo "386" ;;
-        s390x) echo "s390x" ;;
-        *) die "不支持的架构: $(uname -m)" ;;
-    esac
-}
-install_singbox() {
-    echo "正在安装 sing-box ..."
-    [[ -f "$SINGBOX_BINARY" ]] && { ok "sing-box 已安装，跳过"; return; }
+# ── 生成配置和链接 ──
+gen_config() {
+  local proto="$1" port="$2" ext_ip="$3"
+  local uuid ws_path link cf_enabled="no" domain="" zone_id=""
 
-    local arch
-    arch=$(get_singbox_arch)
-    local mem
-    mem=$(get_mem_mb)
+  uuid=$(gen_uuid)
+  ws_path="/${uuid}"
+  mkdir -p "$CONF_DIR"
 
-    # 优先级: SINGBOX_MINI_URL 环境变量 > 低内存自动用精简版 > 官方完整版
-    local download_url=""
-    if [[ -n "$SINGBOX_MINI_URL" ]]; then
-        download_url="$SINGBOX_MINI_URL"
-        info "使用自定义精简版地址"
-    elif [[ "$mem" -lt 128 ]]; then
-        echo ""
-        warn "检测到内存仅 ${mem}MB，官方完整版 (~15MB) 可能运行不稳定"
-        echo "  精简版 (UPX压缩, ~5MB) 更适合低内存小鸡"
-        echo "  编译方法: CGO_ENABLED=0 go build -trimpath -ldflags \"-s -w\" ./cmd/sing-box && upx --best --lzma sing-box"
-        read -rp "使用精简版? (Y/n，回车=是): " use_mini
-        if [[ "${use_mini,,}" =~ ^(|y|yes)$ ]]; then
-            if [[ -z "$SINGBOX_MINI_URL" ]]; then
-                echo ""
-                echo "  请设置精简版下载地址:"
-                echo "    export SINGBOX_MINI_URL=https://你的地址/sing-box-linux-${arch}"
-                echo "    bash $0 install"
-                echo ""
-                echo "  或继续使用官方完整版（可能 OOM）"
-                read -rp "继续用官方完整版? (y/N): " use_official
-                [[ "${use_official,,}" =~ ^(y|yes)$ ]] || die "已取消，请先配置 SINGBOX_MINI_URL"
-            else
-                download_url="$SINGBOX_MINI_URL"
-            fi
-        fi
-    fi
-
-    mkdir -p "$SINGBOX_WORK_DIR" "$SINGBOX_CONF_DIR"
-
-    if [[ -n "$download_url" ]]; then
-        info "下载精简版 sing-box (${arch})..."
-        curl -fsSL "$download_url" -o "$SINGBOX_BINARY" || die "精简版下载失败"
-        chmod +x "$SINGBOX_BINARY"
-    else
-        # 官方完整版
-        local ver=""
-        ver=$(curl -sf "$SINGBOX_OFFICIAL_API" 2>/dev/null | jq -r '.tag_name' 2>/dev/null) || true
-        [[ -n "$ver" && "$ver" != "null" ]] && ver="${ver#v}" || ver="1.11.0"
-        info "下载 sing-box v${ver} (linux/${arch})..."
-        local url="https://github.com/SagerNet/sing-box/releases/download/v${ver}/sing-box-${ver}-linux-${arch}.tar.gz"
-        local tmp="/tmp/sb-install-$$"
-        mkdir -p "$tmp"
-        curl -fsSL -o "$tmp/sb.tar.gz" "$url" || die "下载失败"
-        tar xzf "$tmp/sb.tar.gz" -C "$tmp/"
-        cp "$tmp/sing-box-${ver}-linux-${arch}/sing-box" "$SINGBOX_BINARY"
-        chmod +x "$SINGBOX_BINARY"
-        rm -rf "$tmp"
-    fi
-
-    # 验证二进制可用
-    "$SINGBOX_BINARY" version >/dev/null 2>&1 || die "sing-box 二进制不可用"
-    ok "sing-box 安装完成: $("$SINGBOX_BINARY" version 2>/dev/null | head -1)"
-}
-
-# ── sing-box 配置生成（多文件）────────────────────────
-gen_singbox_config() {
-    local routes_json="$1" uid="$2"
-    local conf_dir="$SINGBOX_CONF_DIR"
-    mkdir -p "$conf_dir"
-
-    # log — error 级别最省内存
-    cat > "$conf_dir/log.json" << 'EOF'
-{"log":{"disabled":false,"level":"error","output":"/etc/sing-box/sing-box.log","timestamp":false}}
-EOF
-
-    # dns — 本地解析，不远程查询，最省内存
-    cat > "$conf_dir/dns.json" << 'EOF'
-{"dns":{"servers":[{"tag":"local","type":"local"}],"strategy":"ipv4_only"}}
-EOF
-
-    # inbounds — 三个协议，均 WS 无 TLS（CF flexible 模式，TLS 在边缘终止）
-    local inbounds
-    inbounds=$(echo "$routes_json" | jq --arg uid "$uid" '[
-        .[] | {
-            tag: ("in-" + .protocol + "-" + (.listen_port|tostring)),
-            type: .protocol,
-            listen: "::",
-            listen_port: .listen_port,
-            users: (
-                if .protocol == "trojan" then [{"password":$uid}]
-                else [{"uuid":$uid}]
-                end
-            ),
-            transport: {"type":"ws","path":.path}
-        }
-    ]')
-    echo "{\"inbounds\":$inbounds}" > "$conf_dir/inbounds.json"
-
-    # outbounds — 直连
-    cat > "$conf_dir/outbounds.json" << 'EOF'
-{"outbounds":[{"type":"direct","tag":"direct"}]}
-EOF
-
-    # route — 不分流，最省内存
-    cat > "$conf_dir/route.json" << 'EOF'
-{"route":{"final":"direct"}}
-EOF
-
-    ok "sing-box 配置已写入 $conf_dir/ (log/dns/inbounds/outbounds/route)"
-}
-
-# ── 订阅链接 ─────────────────────────────────────────
-# 复用 yx-auto.pages.dev 订阅转换服务，生成 vless/vmess/trojan 订阅
-SUB_BASE="https://yx-auto.pages.dev"
-build_link() {
-    local uid="$1" domain="$2" proto="$3" path="$4"
-    local ev="no" et="no" evm="no"
-    case "$proto" in vless) ev="yes";; trojan) et="yes";; vmess) evm="yes";; esac
-    echo "${SUB_BASE}/${uid}/sub?domain=${domain}&epd=yes&epi=yes&egi=no&dkby=yes&ev=${ev}&et=${et}&mess=${evm}&path=$(urlencode "$path")"
-}
-gen_all_links() {
-    local uid="$1" domain="$2" routes_json="$3"
-    local links_json='{}'
-    local proto path link
-    while IFS=$'\t' read -r proto path; do
-        link=$(build_link "$uid" "$domain" "$proto" "$path")
-        links_json=$(echo "$links_json" | jq --arg p "$proto" --arg l "$link" '. + {($p):$l}')
-    done < <(echo "$routes_json" | jq -r '.[] | [.protocol, .path] | @tsv')
-    echo "$links_json"
-}
-
-# ── 状态 ──────────────────────────────────────────────
-load_state() { [[ -f "$STATE_PATH" ]] && cat "$STATE_PATH"; }
-save_state() { mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"; echo "$1" > "$STATE_PATH"; chmod 600 "$STATE_PATH"; }
-remove_state() { rm -f "$STATE_PATH"; }
-save_links_snapshot() {
-    local domain="$1" uid="$2" links_json="$3"
-    { echo "域名: $domain"; echo "UUID: $uid"; echo
-      echo "$links_json" | jq -r 'to_entries[] | "\(.key) \(.value)"'
-    } > "$LAST_LINKS_PATH"
-    chmod 600 "$LAST_LINKS_PATH"
-}
-print_links() {
-    local links_json="$1"
-    local proto link
-    while IFS=$'\t' read -r proto link; do
-        echo "  ${PROTO_LABEL[$proto]:-$proto}订阅 $link"
-    done < <(echo "$links_json" | jq -r 'to_entries[] | [.key, .value] | @tsv')
-}
-
-# ── 交互辅助 ─────────────────────────────────────────
-prompt_protocols() {
-    read -rp "创建协议(1=vless,2=trojan,3=vmess，逗号分隔，留空=全部): " proto_raw
-    local protocols=()
-    if [[ -z "$proto_raw" ]]; then
-        protocols=(vless trojan vmess)
-    else
-        local -A pmap=([1]=vless [2]=trojan [3]=vmess [vless]=vless [trojan]=trojan [vmess]=vmess)
-        IFS=',' read -ra tokens <<< "$proto_raw"
-        for t in "${tokens[@]}"; do
-            t="${t,,}"; t="${t// /}"
-            [[ -n "${pmap[$t]:-}" ]] || die "未知协议: $t"
-            protocols+=("${pmap[$t]}")
-        done
-    fi
-    echo "${protocols[@]}"
-}
-prompt_uuid() {
-    local uid
-    read -rp "UUID(留空=自动生成): " custom_uuid
-    if [[ -n "$custom_uuid" ]]; then
-        [[ "$custom_uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || die "UUID 格式不正确"
-        uid="${custom_uuid,,}"
-    else
-        uid=$(gen_uuid)
-    fi
-    echo "$uid"
-}
-prompt_path_prefix() {
-    local default="$1"
-    read -rp "WS 路径前缀(留空=/${default}): " pfx
-    [[ -z "$pfx" ]] && pfx="/${default}"
-    [[ "$pfx" == /* ]] || pfx="/${pfx}"
-    echo "$pfx"
-}
-build_routes() {
-    local net_mode="$1" path_prefix="$2" proto_count="$3"
-    shift 3
-    local protocols=("$@")
-    local routes_json='[]'
-    if [[ "$net_mode" == "nat" ]]; then
-        echo >&2
-        info "NAT 模式: 逐个配置每个协议的端口映射" >&2
-        echo >&2
-        for proto in "${protocols[@]}"; do
-            local int_port ext_port
-            read -rp "${proto} 内部监听端口(sing-box监听): " int_port
-            [[ "$int_port" =~ ^[0-9]+$ ]] || die "无效端口: $int_port"
-            read -rp "${proto} 外部映射端口(对外暴露): " ext_port
-            [[ "$ext_port" =~ ^[0-9]+$ ]] || die "无效端口: $ext_port"
-            local path="${path_prefix}-${PROTO_SUFFIX[$proto]}"
-            routes_json=$(echo "$routes_json" | jq \
-                --arg p "$proto" --argjson lp "$((int_port))" --argjson cp "$((ext_port))" --arg pa "$path" \
-                '. + [{protocol:$p, listen_port:$lp, cf_port:$cp, path:$pa}]')
-        done
-    else
-        read -rp "自定义端口?(逗号分隔，留空=随机): " custom_ports_raw
-        local existing_ports
-        existing_ports=$(get_listening_ports)
-        local custom_ports=()
-        if [[ -n "$custom_ports_raw" ]]; then
-            IFS=',' read -ra custom_ports <<< "$custom_ports_raw"
-            [[ ${#custom_ports[@]} -eq $proto_count ]] || die "端口数量与协议数不一致"
-        fi
-        local pi=0
-        for proto in "${protocols[@]}"; do
-            local port
-            if [[ ${#custom_ports[@]} -gt 0 ]]; then
-                port="${custom_ports[$pi]// /}"
-                [[ "$port" =~ ^[0-9]+$ ]] || die "无效端口: $port"
-            else
-                port=$(rand_port "$existing_ports")
-            fi
-            existing_ports="$existing_ports $port"
-            local path="${path_prefix}-${PROTO_SUFFIX[$proto]}"
-            routes_json=$(echo "$routes_json" | jq \
-                --arg p "$proto" --argjson lp "$((port))" --arg pa "$path" \
-                '. + [{protocol:$p, listen_port:$lp, cf_port:$lp, path:$pa}]')
-            pi=$((pi + 1))
-        done
-    fi
-    echo "$routes_json"
-}
-
-# ── 1. 安装 ──────────────────────────────────────────
-do_install() {
-    local state
-    state=$(load_state 2>/dev/null || true)
-    [[ -n "$state" ]] && die "检测到上次配置($(echo "$state" | jq -r '.domain // "?"'))，请先卸载"
-
-    # 64M 小鸡优化：先加 swap
-    ensure_swap
-
-    [[ -f "$SINGBOX_BINARY" ]] && ok "sing-box 已安装" || install_singbox
-
-    local net_mode
-    net_mode=$(prompt_net_mode "$(detect_nat)")
-    ok "网络模式: $(net_mode_label "$net_mode")"
-    prompt_cf
-
-    local domain zone_id
-    while true; do
-        read -rp "绑定域名: " domain || die "输入已中断"
-        if [[ -z "$domain" ]]; then
-            echo "域名不能为空，请重试"
-            continue
-        fi
+  # WS 协议询问是否使用 CF 边缘代理
+  if [ "$proto" = "1" ] || [ "$proto" = "2" ] || [ "$proto" = "3" ]; then
+    printf "是否通过 Cloudflare (CDN) 隐藏真实 IP？(y/N): "
+    read use_cf
+    if [ "$use_cf" = "y" ] || [ "$use_cf" = "Y" ]; then
+      cf_enabled="yes"
+      prompt_cf
+      while true; do
+        printf "请输入你的托管域名 (例如 sub.example.com): "
+        read domain
         if zone_id=$(cf_find_zone "$domain"); then
-            info "匹配到 Zone: $zone_id"
-            break
+          break
         fi
-        echo "无法在该 CF 账号下匹配 Zone: $domain，请确认域名已托管并重输（Ctrl+C 退出）"
-    done
+        echo -e "${RED}✗ 未能在你的 CF 账号中找到该域名对应的 Zone，请重新输入${PLAIN}"
+      done
+    fi
+  fi
 
-    local protocols_str
-    protocols_str=$(prompt_protocols)
-    read -ra protocols <<< "$protocols_str"
-    local uid
-    uid=$(prompt_uuid)
-    local short_id="${uid:0:8}"
-    local path_prefix
-    path_prefix=$(prompt_path_prefix "$short_id")
-    local routes_json
-    routes_json=$(build_routes "$net_mode" "$path_prefix" "${#protocols[@]}" "${protocols[@]}")
+  case $proto in
+  1) # VLESS+WS
+    cat > "$CONF" <<JSON
+{
+  "inbounds": [{
+    "type": "vless",
+    "listen": "::",
+    "listen_port": ${port},
+    "users": [{"uuid": "${uuid}"}],
+    "transport": {"type": "ws", "path": "${ws_path}"}
+  }],
+  "outbounds": [{"type": "direct"}]
+}
+JSON
+    if [ "$cf_enabled" = "yes" ]; then
+      link="vless://${uuid}@${domain}:443?encryption=none&security=tls&sni=${domain}&type=ws&path=$(urlencode "$ws_path")#VLESS-CF-${domain}"
+    else
+      link="vless://${uuid}@${ext_ip}:${port}?type=ws&path=${ws_path}&security=none#VLESS-WS-${port}"
+    fi
+    ;;
 
-    echo
-    echo "配置预览:"
-    echo "  域名:  $domain"
-    echo "  UUID:  $uid"
-    echo "  模式:  $net_mode"
-    echo "$routes_json" | jq -r '.[] | "  \(.protocol)  监听:\(.listen_port)  CF端口:\(.cf_port)  路径:\(.path)"'
-    echo
-    read -rp "确认部署? (Y/n): " confirm
-    [[ "${confirm,,}" =~ ^(|y|yes)$ ]] || die "已取消"
+  2) # VMess+WS
+    cat > "$CONF" <<JSON
+{
+  "inbounds": [{
+    "type": "vmess",
+    "listen": "::",
+    "listen_port": ${port},
+    "users": [{"uuid": "${uuid}"}],
+    "transport": {"type": "ws", "path": "${ws_path}"}
+  }],
+  "outbounds": [{"type": "direct"}]
+}
+JSON
+    local vmess_json
+    if [ "$cf_enabled" = "yes" ]; then
+      vmess_json=$(printf '{"v":"2","ps":"VMess-CF-%s","add":"%s","port":"443","id":"%s","aid":"0","scy":"auto","net":"ws","type":"none","host":"%s","path":"%s","tls":"tls"}' \
+        "$domain" "$domain" "$uuid" "$domain" "$ws_path")
+    else
+      vmess_json=$(printf '{"v":"2","ps":"VMess-WS-%s","add":"%s","port":"%s","id":"%s","aid":"0","scy":"auto","net":"ws","path":"%s"}' \
+        "$port" "$ext_ip" "$port" "$uuid" "$ws_path")
+    fi
+    link="vmess://$(echo "$vmess_json" | base64 | tr -d '\n')"
+    ;;
 
-    # sing-box 配置 + 启动
-    gen_singbox_config "$routes_json" "$uid"
-    [[ "$INIT_SYSTEM" == "openrc" && ! -f "$SINGBOX_OPENRC_SCRIPT" ]] && write_openrc_script && ok "OpenRC 服务脚本已创建"
-    restart_singbox
+  3) # Trojan+WS
+    cat > "$CONF" <<JSON
+{
+  "inbounds": [{
+    "type": "trojan",
+    "listen": "::",
+    "listen_port": ${port},
+    "users": [{"password": "${uuid}"}],
+    "transport": {"type": "ws", "path": "${ws_path}"}
+  }],
+  "outbounds": [{"type": "direct"}]
+}
+JSON
+    if [ "$cf_enabled" = "yes" ]; then
+      link="trojan://${uuid}@${domain}:443?security=tls&sni=${domain}&type=ws&path=$(urlencode "$ws_path")#Trojan-CF-${domain}"
+    else
+      link="trojan://${uuid}@${ext_ip}:${port}?type=ws&path=${ws_path}#Trojan-WS-${port}"
+    fi
+    ;;
 
-    # CF 配置
-    local public_ip dns_before ssl_before origin_rules_before dns_record_id
-    public_ip=$(get_public_ip)
-    dns_before=$(cf_get_dns "$zone_id" "$domain" || echo "null")
-    [[ "$dns_before" == "" ]] && dns_before="null"
-    ssl_before=$(cf_get_ssl "$zone_id")
-    origin_rules_before=$(cf_get_origin_rules "$zone_id")
-    dns_record_id=$(cf_upsert_dns "$zone_id" "$domain" "$public_ip")
-    ok "DNS A 记录: $domain -> $public_ip (已代理)"
+  4) # VLESS-Reality
+    gen_reality_keypair
+    local reality_sid
+    reality_sid=$(gen_shortid)
+    cat > "$CONF" <<JSON
+{
+  "inbounds": [{
+    "type": "vless",
+    "listen": "::",
+    "listen_port": ${port},
+    "users": [{"uuid": "${uuid}", "flow": "xtls-rprx-vision"}],
+    "tls": {
+      "enabled": true,
+      "server_name": "www.apple.com",
+      "reality": {
+        "enabled": true,
+        "handshake": {"server": "www.apple.com", "server_port": 443},
+        "private_key": "${REALITY_PRIVATE}",
+        "short_id": ["${reality_sid}"]
+      }
+    }
+  }],
+  "outbounds": [{"type": "direct"}]
+}
+JSON
+    link="vless://${uuid}@${ext_ip}:${port}?security=reality&sni=www.apple.com&pbk=${REALITY_PUBLIC}&sid=${reality_sid}&fp=chrome&flow=xtls-rprx-vision#VLESS-Reality-${port}"
+    ;;
+
+  5) # Hysteria2 (UDP)
+    if [ ! -f "$CERT_FILE" ]; then /usr/bin/sing-box generate certificate -c "$CERT_FILE" -k "$KEY_FILE" 2>/dev/null; fi
+    local hy2_pass; hy2_pass=$(gen_rand_pass)
+    cat > "$CONF" <<JSON
+{
+  "inbounds": [{
+    "type": "hysteria2",
+    "listen": "::",
+    "listen_port": ${port},
+    "password": "${hy2_pass}",
+    "tls": {
+      "enabled": true,
+      "alpn": ["h3"],
+      "certificate_path": "${CERT_FILE}",
+      "key_path": "${KEY_FILE}"
+    }
+  }],
+  "outbounds": [{"type": "direct"}]
+}
+JSON
+    link="hysteria2://${hy2_pass}@${ext_ip}:${port}/?insecure=1&sni=www.bing.com#Hysteria2-${port}"
+    ;;
+
+  6) # TUIC v5 (UDP)
+    if [ ! -f "$CERT_FILE" ]; then /usr/bin/sing-box generate certificate -c "$CERT_FILE" -k "$KEY_FILE" 2>/dev/null; fi
+    local tuic_pass; tuic_pass=$(gen_rand_pass)
+    cat > "$CONF" <<JSON
+{
+  "inbounds": [{
+    "type": "tuic",
+    "listen": "::",
+    "listen_port": ${port},
+    "uuid": "${uuid}",
+    "password": "${tuic_pass}",
+    "congestion_control": "bbr",
+    "tls": {
+      "enabled": true,
+      "alpn": ["h3"],
+      "certificate_path": "${CERT_FILE}",
+      "key_path": "${KEY_FILE}"
+    }
+  }],
+  "outbounds": [{"type": "direct"}]
+}
+JSON
+    link="tuic://${uuid}:${tuic_pass}@${ext_ip}:${port}/?congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#TUICv5-${port}"
+    ;;
+  esac
+
+  # 配置生效前的 JSON 校验
+  if ! jq . "$CONF" >/dev/null 2>&1; then
+    echo -e "${RED}✗ 配置文件生成错误！${PLAIN}"
+    exit 1
+  fi
+
+  # 如果启用了 CF，执行 API 联动
+  if [ "$cf_enabled" = "yes" ]; then
+    echo -e "${YELLOW}· 正在配置 Cloudflare DNS 及 Origin Rules...${PLAIN}"
+    cf_upsert_dns "$zone_id" "$domain" "$ext_ip" >/dev/null
     cf_set_ssl "$zone_id" "flexible"
-    ok "SSL 模式: flexible (CF边缘TLS，源站WS明文)"
-    apply_origin_rules "$zone_id" "$domain" "$routes_json"
-    ok "Origin Rules: ${#protocols[@]} 条 (按WS路径转发到对应端口)"
+    local proto_name_str
+    case $proto in 1) proto_name_str="vless";; 2) proto_name_str="vmess";; 3) proto_name_str="trojan";; esac
+    apply_origin_rules "$zone_id" "$domain" "$proto_name_str" "$port" "$ws_path"
+    echo -e "${GREEN}✓ Cloudflare 加速代理配置成功！${PLAIN}"
+  fi
 
-    # 安全规则：关闭可能拦截 WS 的设置
-    local security_backup
-    security_backup=$(cf_relax_security "$zone_id")
+  echo "$link" > "$LAST_LINK_FILE"
 
-    # 订阅
-    local links_json
-    links_json=$(gen_all_links "$uid" "$domain" "$routes_json")
-    save_links_snapshot "$domain" "$uid" "$links_json"
-
-    # 状态保存
-    local dns_existed="false"
-    [[ "$dns_before" != "null" ]] && dns_existed="true"
-    [[ -n "$dns_before" ]]          || dns_before="null"
-    [[ -n "$origin_rules_before" ]] || origin_rules_before="[]"
-    [[ -n "$security_backup" ]]     || security_backup="null"
-    [[ -n "$links_json" ]]          || links_json="{}"
-    [[ -n "$routes_json" ]]         || routes_json="[]"
-    save_state "$(jq -n \
-        --arg d "$domain" --arg z "$zone_id" --arg u "$uid" --arg s "$short_id" --arg mode "$net_mode" \
-        --argjson routes "$routes_json" \
-        --arg drid "$dns_record_id" --argjson dex "$dns_existed" --argjson drec "$dns_before" \
-        --arg ssl "$ssl_before" --argjson orbk "$origin_rules_before" --argjson links "$links_json" \
-        --argjson secbk "$security_backup" \
-        '{domain:$d,zone_id:$z,uuid:$u,short_id:$s,net_mode:$mode,routes:$routes,
-          managed_dns_record_id:$drid,dns_backup:{existed:$dex,record:$drec},
-          ssl_backup:$ssl,origin_rules_backup:$orbk,security_backup:$secbk,links:$links}')"
-
-    echo
-    ok "部署完成"
-    print_links "$links_json"
-    echo
-    echo "订阅已保存到 $LAST_LINKS_PATH"
-    echo
-    echo "客户端配置要点:"
-    echo "  地址: $domain  端口: 443  TLS: 开启  SNI: $domain"
-    echo "  网络: WS  路径: 对应协议的 path (见上)"
-    echo "  Trojan 同样走 WS over CF，客户端需支持 Trojan+WS"
+  echo -e "\n${GREEN}==================== 节点信息 ====================${PLAIN}"
+  echo "  协议   : $(proto_name "$proto")"
+  echo "  端口   : ${port}"
+  [ "$cf_enabled" = "yes" ] && echo "  代理域名: ${domain} (通过 CF 443 端口)" || echo "  外部IP : ${ext_ip}"
+  echo -e "${GREEN}----------------------------------------------------${PLAIN}"
+  echo -e "  节点链接:\n  ${YELLOW}${link}${PLAIN}"
+  echo -e "${GREEN}====================================================${PLAIN}\n"
 }
 
-# ── 2. 卸载 ──────────────────────────────────────────
-do_uninstall() {
-    local state
-    state=$(load_state 2>/dev/null || true)
-    [[ -n "$state" ]] || die "未检测到上次配置"
-    local domain; domain=$(echo "$state" | jq -r '.domain')
-    echo "正在卸载: $domain"
-    stop_singbox; rm -rf "$SINGBOX_CONF_DIR"
-    ok "sing-box 已停止"
-    if load_cf_account; then
-        local zone_id; zone_id=$(echo "$state" | jq -r '.zone_id // ""')
-        if [[ -n "$zone_id" ]]; then
-            cf_put_origin_rules "$zone_id" "$(echo "$state" | jq '.origin_rules_backup // []')"
-            ok "Origin Rules 已恢复"
-            local ssl_bk; ssl_bk=$(echo "$state" | jq -r '.ssl_backup // ""')
-            [[ -n "$ssl_bk" ]] && cf_set_ssl "$zone_id" "$ssl_bk" && ok "SSL: $ssl_bk"
-            local dns_existed record_id
-            dns_existed=$(echo "$state" | jq -r '.dns_backup.existed')
-            record_id=$(echo "$state" | jq -r '.managed_dns_record_id // ""')
-            if [[ "$dns_existed" == "true" ]]; then
-                local rp; rp=$(echo "$state" | jq '.dns_backup.record | {type:(.type//"A"),name:(.name//""),content:(.content//""),proxied:(.proxied//false),ttl:(.ttl//1)}')
-                cf_call PUT "/zones/${zone_id}/dns_records/${record_id}" "$rp" >/dev/null
-                ok "DNS 已恢复"
-            elif [[ -n "$record_id" ]]; then
-                cf_call_raw DELETE "/zones/${zone_id}/dns_records/${record_id}" >/dev/null 2>&1 || true
-                ok "DNS 已删除"
-            fi
-            local sec_bk; sec_bk=$(echo "$state" | jq '.security_backup // null')
-            cf_restore_security "$zone_id" "$sec_bk"
-        fi
-    else
-        echo "无 CF 凭据，跳过恢复"
-    fi
-    remove_state
-    rm -f "$LAST_LINKS_PATH" "$CF_ACCOUNT_PATH"
-    ok "已清理订阅快照与 CF 凭据"
-    ok "卸载完成"
+proto_name() {
+  case $1 in
+  1) echo "VLESS+WS" ;; 2) echo "VMess+WS" ;; 3) echo "Trojan+WS" ;;
+  4) echo "VLESS-Reality" ;; 5) echo "Hysteria2" ;; 6) echo "TUIC v5" ;;
+  esac
 }
 
-# ── 3. 查看订阅 ──────────────────────────────────────
-do_show() {
-    if [[ -f "$LAST_LINKS_PATH" ]]; then cat "$LAST_LINKS_PATH"; return; fi
-    local state; state=$(load_state 2>/dev/null || true)
-    [[ -n "$state" ]] || die "无历史订阅"
-    echo "域名: $(echo "$state" | jq -r '.domain')"
-    echo "UUID: $(echo "$state" | jq -r '.uuid')"
-    echo "$state" | jq -r '.links | to_entries[] | "\(.key) \(.value)"'
+menu_proto() {
+  echo -e "\n===== 协议选择 ====="
+  echo "  1) VLESS+WS (支持 Cloudflare CDN 代理)"
+  echo "  2) VMess+WS (支持 Cloudflare CDN 代理)"
+  echo "  3) Trojan+WS (支持 Cloudflare CDN 代理)"
+  echo "  4) VLESS-Reality (直连高性能)"
+  echo "  5) Hysteria2 (UDP 高速直连)"
+  echo "  6) TUIC v5 (UDP 高速直连)"
+  printf "请选择协议 [1-6]: "
+  read proto_sel
+  if ! echo "$proto_sel" | grep -qE '^[1-6]$'; then
+    echo -e "${RED}✗ 只能选择 1-6${PLAIN}"
+    return 1
+  fi
+
+  printf "输入本地监听端口 (10000-60000) [默认随机]: "
+  read lport
+  if [ -z "$lport" ]; then
+    lport=$(awk -v min=10000 -v max=60000 'BEGIN{srand(); print int(min+rand()*(max-min+1))}')
+    echo -e "${YELLOW}· 已分配随机端口: $lport${PLAIN}"
+  elif ! echo "$lport" | grep -qE '^[0-9]+$' || [ "$lport" -lt 10000 ] || [ "$lport" -gt 60000 ]; then
+    echo -e "${RED}✗ 端口非法${PLAIN}"
+    return 1
+  fi
+
+  local ext_ip
+  ext_ip=$(get_external_ip)
+  gen_config "$proto_sel" "$lport" "$ext_ip"
+
+  if rc-service ${SERVICE_NAME} status >/dev/null 2>&1; then
+    rc-service ${SERVICE_NAME} restart
+  else
+    rc-service ${SERVICE_NAME} start
+  fi
+  echo -e "${GREEN}· sing-box 服务已启动！${PLAIN}"
 }
 
-# ── 4. 修改配置 ──────────────────────────────────────
-do_modify() {
-    local state; state=$(load_state 2>/dev/null || true)
-    [[ -n "$state" ]] || die "未检测到部署"
-    local domain uid routes_json net_mode
-    domain=$(echo "$state" | jq -r '.domain')
-    uid=$(echo "$state" | jq -r '.uuid')
-    routes_json=$(echo "$state" | jq '.routes')
-    net_mode=$(echo "$state" | jq -r '.net_mode // "direct"')
-    echo
-    echo "当前配置 ($net_mode):"
-    echo "  域名: $domain  UUID: $uid"
-    echo "$routes_json" | jq -r '.[] | "  \(.protocol)  监听:\(.listen_port)  CF端口:\(.cf_port)  路径:\(.path)"'
-    echo
-    echo "  1. 修改 UUID"
-    echo "  2. 修改端口"
-    echo "  3. 修改 WS 路径"
-    echo "  4. 全部修改"
-    echo "  0. 返回"
-    echo
-    read -rp "请选择 [0-4]: " mc
-    local new_uid="$uid" new_routes="$routes_json" changed=false
-    [[ "$mc" =~ ^[0-4]$ ]] || die "无效选项"
-    [[ "$mc" == "0" ]] && return
-    if [[ "$mc" == "1" || "$mc" == "4" ]]; then
-        read -rp "新 UUID(留空=重新生成): " iu
-        if [[ -n "$iu" ]]; then
-            [[ "$iu" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || die "UUID 格式不正确"
-            new_uid="${iu,,}"
-        else
-            new_uid=$(gen_uuid)
-        fi
-        changed=true; ok "UUID: $new_uid"
-    fi
-    if [[ "$mc" == "2" || "$mc" == "4" ]]; then
-        local pc; pc=$(echo "$new_routes" | jq 'length')
-        if [[ "$net_mode" == "nat" ]]; then
-            echo "当前映射: $(echo "$new_routes" | jq -r '[.[] | "\(.listen_port):\(.cf_port)"] | join(",")')"
-            read -rp "新端口映射(内部:外部，共${pc}组，留空=不改): " mr
-            if [[ -n "$mr" ]]; then
-                IFS=',' read -ra maps <<< "$mr"
-                [[ ${#maps[@]} -eq $pc ]] || die "数量不匹配"
-                local idx=0
-                for m in "${maps[@]}"; do
-                    m="${m// /}"; local lp="${m%%:*}" cp="${m##*:}"
-                    [[ "$lp" =~ ^[0-9]+$ && "$cp" =~ ^[0-9]+$ ]] || die "无效: $m"
-                    new_routes=$(echo "$new_routes" | jq --argjson i $idx --argjson l "$((lp))" --argjson c "$((cp))" '.[$i].listen_port=$l|.[$i].cf_port=$c')
-                    idx=$((idx+1))
-                done
-                changed=true; ok "端口已更新"
-            fi
-        else
-            echo "当前端口: $(echo "$new_routes" | jq -r '[.[].listen_port|tostring] | join(",")')"
-            read -rp "新端口(逗号分隔，共${pc}个，留空=不改): " pr
-            if [[ -n "$pr" ]]; then
-                IFS=',' read -ra nps <<< "$pr"
-                [[ ${#nps[@]} -eq $pc ]] || die "数量不匹配"
-                local idx=0
-                for np in "${nps[@]}"; do
-                    np="${np// /}"; [[ "$np" =~ ^[0-9]+$ ]] || die "无效: $np"
-                    new_routes=$(echo "$new_routes" | jq --argjson i $idx --argjson p "$((np))" '.[$i].listen_port=$p|.[$i].cf_port=$p')
-                    idx=$((idx+1))
-                done
-                changed=true; ok "端口已更新"
-            fi
-        fi
-    fi
-    if [[ "$mc" == "3" || "$mc" == "4" ]]; then
-        echo "当前路径: $(echo "$new_routes" | jq -r '[.[].path] | join(", ")')"
-        read -rp "新 WS 路径前缀(留空=不改): " np
-        if [[ -n "$np" ]]; then
-            [[ "$np" == /* ]] || np="/${np}"
-            new_routes=$(echo "$new_routes" | jq --arg pfx "$np" '[.[]|.path=($pfx+"-"+(if .protocol=="vless" then "vl" elif .protocol=="trojan" then "tr" else "vm" end))]')
-            changed=true; ok "路径已更新"
-        fi
-    fi
-    [[ "$changed" == "true" ]] || { echo "无修改"; return; }
-    gen_singbox_config "$new_routes" "$new_uid"
-    restart_singbox
-    if load_cf_account; then
-        apply_origin_rules "$(echo "$state" | jq -r '.zone_id')" "$domain" "$new_routes"
-        ok "Origin Rules 已更新"
-    fi
-    local links_json; links_json=$(gen_all_links "$new_uid" "$domain" "$new_routes")
-    save_links_snapshot "$domain" "$new_uid" "$links_json"
-    save_state "$(echo "$state" | jq --arg u "$new_uid" --argjson r "$new_routes" --argjson l "$links_json" --arg s "${new_uid:0:8}" \
-        '.uuid=$u|.short_id=$s|.routes=$r|.links=$l')"
-    echo; ok "配置已更新"; print_links "$links_json"
-}
-
-# ── 5. 查看当前配置 ──────────────────────────────────
-do_show_config() {
-    local state; state=$(load_state 2>/dev/null || true)
-    [[ -n "$state" ]] || die "未检测到部署"
-    echo
-    echo "域名:  $(echo "$state" | jq -r '.domain')"
-    echo "UUID:  $(echo "$state" | jq -r '.uuid')"
-    echo "模式:  $(echo "$state" | jq -r '.net_mode // "direct"')"
-    echo
-    echo "入站:"
-    echo "$state" | jq -r '.routes[] | "  \(.protocol)  监听:\(.listen_port)  CF端口:\(.cf_port)  路径:\(.path)"'
-    echo
-    echo -n "sing-box: "; svc_is_active && echo "运行中" || echo "未运行"
-    echo
-    echo "内存占用:"
-    ps -o rss= -C sing-box 2>/dev/null | awk '{sum+=$1} END {printf "  RSS: %.1f MB\n", sum/1024}' || echo "  无法获取"
-    echo
-    echo "订阅:"
-    print_links "$(echo "$state" | jq '.links')"
-    echo
-}
-
-# ── 6. 更新外部端口（NAT 快捷操作）──────────────────
-do_update_ports() {
-    local state; state=$(load_state 2>/dev/null || true)
-    [[ -n "$state" ]] || die "未检测到部署"
-    local domain routes_json net_mode
-    domain=$(echo "$state" | jq -r '.domain')
-    routes_json=$(echo "$state" | jq '.routes')
-    net_mode=$(echo "$state" | jq -r '.net_mode // "direct"')
-    echo
-    echo "当前端口映射:"
-    echo "$routes_json" | jq -r '.[] | "  \(.protocol)  监听:\(.listen_port) -> 外部:\(.cf_port)"'
-    echo
-    local pc; pc=$(echo "$routes_json" | jq 'length')
-    if [[ "$net_mode" == "nat" ]]; then
-        info "NAT 模式: 只更新外部端口(CF Origin Rules)，sing-box 监听端口不变"
-        echo
-        local new_routes="$routes_json" idx=0
-        local rows=() row
-        mapfile -t rows < <(echo "$routes_json" | jq -r '.[] | [.protocol, (.cf_port|tostring)] | @tsv')
-        for row in "${rows[@]}"; do
-            local proto="${row%%$'\t'*}" old_cp="${row##*$'\t'}" ne
-            read -rp "${proto} 新外部端口(当前=${old_cp}): " ne
-            [[ -n "$ne" ]] || die "不能为空"
-            [[ "$ne" =~ ^[0-9]+$ ]] || die "无效端口: $ne"
-            new_routes=$(echo "$new_routes" | jq --argjson i $idx --argjson p "$((ne))" '.[$i].cf_port=$p')
-            idx=$((idx+1))
-        done
-        echo
-        echo "更新预览:"
-        echo "$new_routes" | jq -r '.[] | "  \(.protocol)  监听:\(.listen_port) -> 外部:\(.cf_port)"'
-        read -rp "确认? (Y/n): " confirm
-        [[ "${confirm,,}" =~ ^(|y|yes)$ ]] || die "已取消"
-        load_cf_account || die "未找到 CF 凭据"
-        apply_origin_rules "$(echo "$state" | jq -r '.zone_id')" "$domain" "$new_routes"
-        ok "Origin Rules 已更新"
-        local public_ip; public_ip=$(get_public_ip)
-        local zone_id; zone_id=$(echo "$state" | jq -r '.zone_id')
-        local current_dns; current_dns=$(cf_get_dns "$zone_id" "$domain")
-        local current_ip; current_ip=$(echo "$current_dns" | jq -r '.content // ""')
-        if [[ "$current_ip" != "$public_ip" ]]; then
-            cf_upsert_dns "$zone_id" "$domain" "$public_ip" >/dev/null
-            ok "DNS 已更新: $domain -> $public_ip"
-        fi
-        local uid; uid=$(echo "$state" | jq -r '.uuid')
-        local links_json; links_json=$(gen_all_links "$uid" "$domain" "$new_routes")
-        save_links_snapshot "$domain" "$uid" "$links_json"
-        save_state "$(echo "$state" | jq --argjson r "$new_routes" --argjson l "$links_json" '.routes=$r|.links=$l')"
-        echo; ok "外部端口已更新"; print_links "$links_json"
-    else
-        info "直连模式: 端口变更需要同时修改 sing-box 监听，请使用 [4.修改配置]"
-    fi
-}
-
-# ── 7. 重启 sing-box ─────────────────────────────────
-do_restart() {
-    if ! svc_is_active; then
-        echo "sing-box 当前未运行，正在启动..."
-    else
-        echo "正在重启 sing-box..."
-    fi
-    restart_singbox
-}
-
-# ── 8. 切换网络模式 ──────────────────────────────────
-do_switch_net_mode() {
-    local state; state=$(load_state 2>/dev/null || true)
-    [[ -n "$state" ]] || die "未检测到部署"
-    local domain zone_id uid cur routes_json
-    domain=$(echo "$state" | jq -r '.domain')
-    zone_id=$(echo "$state" | jq -r '.zone_id')
-    uid=$(echo "$state" | jq -r '.uuid')
-    cur=$(echo "$state" | jq -r '.net_mode // "direct"')
-    routes_json=$(echo "$state" | jq '.routes')
-    echo
-    echo "当前模式: $(net_mode_label "$cur")"
-    echo "$routes_json" | jq -r '.[] | "  \(.protocol)  监听:\(.listen_port)  外部:\(.cf_port)"'
-    echo
-    local target
-    if [[ "$cur" == "nat" ]]; then
-        target="direct"
-        echo "切成直连后，对外端口将与 sing-box 监听端口一致。"
-    else
-        target="nat"
-        echo "切成 NAT 后，需要为每个协议指定对外端口（路由器/宿主上映射到监听端口）。"
-    fi
-    read -rp "确认切换到 $(net_mode_label "$target")? (y/N): " c
-    [[ "${c,,}" =~ ^(y|yes)$ ]] || die "已取消"
-    local new_routes="$routes_json"
-    if [[ "$target" == "direct" ]]; then
-        new_routes=$(echo "$new_routes" | jq '[.[] | .cf_port = .listen_port]')
-    else
-        local idx=0
-        local rows=() row
-        mapfile -t rows < <(echo "$routes_json" | jq -r '.[] | [.protocol, (.listen_port|tostring)] | @tsv')
-        for row in "${rows[@]}"; do
-            local proto="${row%%$'\t'*}" lp="${row##*$'\t'}" ep
-            read -rp "${proto} 对外端口(监听=${lp}, 回车=相同): " ep
-            [[ -n "$ep" ]] || ep="$lp"
-            [[ "$ep" =~ ^[0-9]+$ ]] || die "无效端口: $ep"
-            new_routes=$(echo "$new_routes" | jq --argjson i $idx --argjson p "$((ep))" '.[$i].cf_port=$p')
-            idx=$((idx+1))
-        done
-    fi
-    echo
-    echo "更新预览:"
-    echo "$new_routes" | jq -r '.[] | "  \(.protocol)  监听:\(.listen_port)  外部:\(.cf_port)"'
-    read -rp "确认? (Y/n): " confirm
-    [[ "${confirm,,}" =~ ^(|y|yes)$ ]] || die "已取消"
-    load_cf_account || die "未找到 CF 凭据"
-    apply_origin_rules "$zone_id" "$domain" "$new_routes"
-    ok "Origin Rules 已更新"
-    local links_json; links_json=$(gen_all_links "$uid" "$domain" "$new_routes")
-    save_links_snapshot "$domain" "$uid" "$links_json"
-    save_state "$(echo "$state" | jq --arg m "$target" --argjson r "$new_routes" --argjson l "$links_json" \
-        '.net_mode=$m | .routes=$r | .links=$l')"
-    echo; ok "已切换到 $(net_mode_label "$target")"; print_links "$links_json"
-}
-
-# ── 快捷指令 ──────────────────────────────────────────
-ensure_shortcut() {
-    local target="/usr/local/bin/sb"
-    [[ -f "$target" ]] && return
-    cat > "$target" << 'SCEOF'
-#!/bin/sh
-exec bash <(curl -fsSL https://raw.githubusercontent.com/qiuxiaoyu001/singbox-cf-lite2/main/singbox_cf_lite.sh) "$@"
-SCEOF
-    chmod +x "$target"
-}
-
-# ── 主入口 ────────────────────────────────────────────
-main() {
-    [[ "$(id -u)" == "0" ]] || die "请使用 root 运行此脚本"
-    detect_init
-    install_deps
-    need_cmd curl; need_cmd jq
-    ensure_shortcut
-    local state current_domain="" net_mode=""
-    state=$(load_state 2>/dev/null || true)
-    if [[ -n "$state" ]]; then
-        current_domain=$(echo "$state" | jq -r '.domain // ""')
-        net_mode=$(echo "$state" | jq -r '.net_mode // ""')
-    fi
-    echo
-    echo "  sing-box-cf-lite ($INIT_SYSTEM)"
-    echo "  三协议: VLESS+WS | VMess+WS | Trojan+WS  ·  CF flexible"
-    echo
-    echo "  1. 安装节点"
-    echo "  2. 卸载"
-    echo "  3. 查看订阅"
-    echo "  4. 修改配置(UUID/端口/路径)"
-    echo "  5. 查看当前配置"
-    echo "  6. 更新外部端口(NAT换端口)"
-    echo "  7. 重启 sing-box"
-    echo "  8. 切换网络模式(直连/NAT)"
-    [[ -n "$current_domain" ]] && echo "     (当前: $current_domain${net_mode:+ [$net_mode]})"
-    echo
-    read -rp "请选择 [1-8]: " choice
-    case "$choice" in
-        1) do_install ;; 2) do_uninstall ;; 3) do_show ;;
-        4) do_modify ;; 5) do_show_config ;; 6) do_update_ports ;;
-        7) do_restart ;; 8) do_switch_net_mode ;;
-        *) die "无效选项: $choice" ;;
+menu_main() {
+  while true; do
+    echo -e "\n  ╔══════════════════════════════════════════╗"
+    echo -e "  ║   ${GREEN}sing-box 6协议 (含Cloudflare支持)${PLAIN}     ║"
+    echo -e "  ╚══════════════════════════════════════════╝\n"
+    echo "  1. 安装 / 部署新节点"
+    echo "  2. 卸载 sing-box"
+    echo "  3. 查看当前节点链接"
+    echo "  4. 查看当前配置文件"
+    echo "  5. 重启 sing-box 服务"
+    echo "  6. 查看服务状态与日志"
+    echo "  0. 退出"
+    echo ""
+    printf "请选择 [0-6]: "
+    read opt
+    case $opt in
+    1)
+      install_dep
+      [ ! -f /usr/bin/sing-box ] && download_singbox
+      [ ! -f /etc/init.d/${SERVICE_NAME} ] && write_service_openrc
+      menu_proto
+      ;;
+    2)
+      printf "确认完全卸载？(y/N): "
+      read confirm
+      if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+        rc-service ${SERVICE_NAME} stop 2>/dev/null
+        rc-update del ${SERVICE_NAME} default 2>/dev/null
+        rm -f /etc/init.d/${SERVICE_NAME}
+        rm -rf "$CONF_DIR"
+        rm -f /usr/bin/sing-box
+        rm -f /var/log/${SERVICE_NAME}.log
+        echo -e "${GREEN}· 卸载完成${PLAIN}"
+      else
+        echo "· 已取消"
+      fi
+      ;;
+    3)
+      [ -f "$LAST_LINK_FILE" ] && echo -e "\n${YELLOW}当前链接:${PLAIN}\n$(cat "$LAST_LINK_FILE")\n" || echo -e "${RED}· 暂无节点${PLAIN}"
+      ;;
+    4)
+      [ -f "$CONF" ] && cat "$CONF" || echo -e "${RED}· 配置文件不存在${PLAIN}"
+      ;;
+    5)
+      rc-service ${SERVICE_NAME} restart
+      echo -e "${GREEN}· 已重启${PLAIN}"
+      ;;
+    6)
+      rc-service ${SERVICE_NAME} status
+      [ -f "/var/log/${SERVICE_NAME}.log" ] && tail -n 10 /var/log/${SERVICE_NAME}.log
+      ;;
+    0)
+      exit 0
+      ;;
+    *)
+      echo -e "${RED}✗ 无效输入${PLAIN}"
+      ;;
     esac
+  done
 }
-main "$@"
+
+menu_main
