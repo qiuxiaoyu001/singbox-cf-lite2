@@ -102,7 +102,7 @@ error_log="/var/log/sing-box.log"
 respawn_delay=2
 respawn_max=0
 respawn_period=86400
-supervise_daemon_args="--respawn-delay ${respawn_delay} --respawn-max ${respawn_max} --respawn-period ${respawn_period}"
+supervise_daemon_args="--respawn-delay 3 --respawn-max 0"
 supervisor=supervise-daemon
 depend() { need net; after firewall; }
 start_pre() {
@@ -139,8 +139,11 @@ ensure_systemd_restart() {
         mkdir -p "$drop"
         cat > "$drop/restart.conf" << 'SDEOF'
 [Service]
-Restart=on-failure
+Restart=always
 RestartSec=3
+Environment=GOGC=20
+Environment=GOMEMLIMIT=48MiB
+MemoryMax=48M
 SDEOF
         systemctl daemon-reload
     fi
@@ -349,7 +352,7 @@ build_origin_rules() {
         .[] | {
             description: ($pfx + .protocol + " " + .path),
             enabled: true,
-            expression: ("(http.host eq \"" + $d + "\" and http.request.uri.path eq \"" + .path + "\")"),
+            expression: ("(http.host eq \"" + $d + "\" and starts_with(http.request.uri.path, \"" + .path + "\"))"),
             action: "route",
             action_parameters: { origin: { port: .ext_port } }
         }
@@ -431,7 +434,7 @@ gen_sb_config() {
         .[] | {
             tag: ("in-" + .protocol + "-" + (.listen_port|tostring)),
             type: .protocol,
-            listen: "::",
+            listen: "0.0.0.0",
             listen_port: .listen_port,
             users: (
                 if .protocol == "trojan" then [{name:"user1", password:$uid}]
@@ -443,9 +446,14 @@ gen_sb_config() {
         }
     ]')
     jq -n --argjson inb "$inbounds" '{
-        log:{level:"warn", timestamp:true, output:"/var/log/sing-box.log"},
+        log:{level:"error"},
         inbounds:$inb,
-        outbounds:[{type:"direct", tag:"direct"}]
+        outbounds:[
+ {type:"direct",tag:"direct"}
+],
+route:{
+ auto_detect_interface:true
+}
     }'
 }
 
@@ -518,7 +526,10 @@ prompt_protocols() {
         protocols=(vless trojan vmess)
     else
         local -A pmap=([1]=vless [2]=trojan [3]=vmess [vless]=vless [trojan]=trojan [vmess]=vmess)
-        IFS=',' read -ra tokens <<< "$proto_raw"
+        # 兼容中文逗号、空格
+proto_raw="${proto_raw//，/,}"
+proto_raw="${proto_raw// /}"
+IFS=',' read -ra tokens <<< "$proto_raw"
         for t in "${tokens[@]}"; do
             t="${t,,}"; t="${t// /}"
             [[ -n "${pmap[$t]:-}" ]] || die "未知协议: $t"
