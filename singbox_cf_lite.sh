@@ -518,15 +518,26 @@ EOF
     ok "sing-box 配置已写入 $conf_dir/ (log/dns/inbounds/outbounds/route)"
 }
 
-# ── 订阅链接 ─────────────────────────────────────────
-# 复用 yx-auto.pages.dev 订阅转换服务，生成 vless/vmess/trojan 订阅
-SUB_BASE="https://yx-auto.pages.dev"
+# ── 单节点链接输出（不使用订阅转换） ─────────────────────
+# 直接生成原始节点，方便用户自行替换优选 IP
 build_link() {
     local uid="$1" domain="$2" proto="$3" path="$4"
-    local ev="no" et="no" evm="no"
-    case "$proto" in vless) ev="yes";; trojan) et="yes";; vmess) evm="yes";; esac
-    echo "${SUB_BASE}/${uid}/sub?domain=${domain}&epd=yes&epi=yes&egi=no&dkby=yes&ev=${ev}&et=${et}&mess=${evm}&path=$(urlencode "$path")"
+    case "$proto" in
+        vless)
+            echo "vless://${uid}@${domain}:443?encryption=none&security=tls&type=ws&host=${domain}&path=$(urlencode "$path")#${proto}"
+            ;;
+        trojan)
+            echo "trojan://${uid}@${domain}:443?security=tls&type=ws&host=${domain}&path=$(urlencode "$path")#${proto}"
+            ;;
+        vmess)
+            local json
+            json=$(jq -n --arg id "$uid" --arg host "$domain" --arg path "$path" \
+              '{v:"2",ps:"vmess",add:$host,port:"443",id:$id,aid:"0",net:"ws",type:"none",host:$host,path:$path,tls:"tls"}')
+            echo "vmess://$(echo -n "$json" | base64 -w0)"
+            ;;
+    esac
 }
+
 gen_all_links() {
     local uid="$1" domain="$2" routes_json="$3"
     local links_json='{}'
@@ -553,7 +564,7 @@ print_links() {
     local links_json="$1"
     local proto link
     while IFS=$'\t' read -r proto link; do
-        echo "  ${PROTO_LABEL[$proto]:-$proto}订阅 $link"
+        echo "  ${PROTO_LABEL[$proto]:-$proto}节点 $link"
     done < <(echo "$links_json" | jq -r 'to_entries[] | [.key, .value] | @tsv')
 }
 
