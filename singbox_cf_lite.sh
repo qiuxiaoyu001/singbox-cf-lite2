@@ -120,14 +120,6 @@ INITEOF
     chmod +x "$SINGBOX_OPENRC_SCRIPT"
 }
 write_systemd_service() {
-    local mem_limit=""
-    local total_mem
-    total_mem=$(get_mem_mb)
-    # 64M 小鸡限制内存，防止 OOM 拖垮系统
-    if [[ "$total_mem" -lt 128 ]]; then
-        mem_limit="MemoryMax=56M
-MemoryHigh=48M"
-    fi
     cat > /etc/systemd/system/sing-box.service << EOF
 [Unit]
 Description=sing-box service (cf-lite)
