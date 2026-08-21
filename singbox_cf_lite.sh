@@ -2,10 +2,9 @@
 set -euo pipefail
 
 # =============================================================
-# sing-box-cf-lite — 三协议极简低内存版
+# sing-box-cf-lite
 # VLESS+WS | Trojan+WS | VMess+WS
 # Cloudflare Flexible + Origin Rules
-# 目标：单 sing-box 进程、最小运行时配置、低内存小鸡
 # =============================================================
 
 SINGBOX_CONF_DIR="/etc/sing-box/conf"
